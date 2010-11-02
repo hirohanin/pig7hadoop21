@@ -1,0 +1,2563 @@
+Index: src/org/apache/pig/PigServer.java
+===================================================================
+--- src/org/apache/pig/PigServer.java	(revision 815927)
++++ src/org/apache/pig/PigServer.java	(working copy)
+@@ -770,7 +770,7 @@
+         PhysicalPlan pp = compilePp(compiledLp);
+         // execute using appropriate engine
+         FileLocalizer.clearDeleteOnFail();
+-        List<ExecJob> execJobs = pigContext.getExecutionEngine().execute(pp, "execute");
++        List<ExecJob> execJobs = pigContext.getExecutionEngine().execute(pp, "job_pigexec_");
+         for (ExecJob execJob: execJobs) {
+             if (execJob.getStatus()==ExecJob.JOB_STATUS.FAILED) {
+                 FileLocalizer.triggerDeleteOnFail();
+Index: src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/SliceWrapper.java
+===================================================================
+--- src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/SliceWrapper.java	(revision 815927)
++++ src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/SliceWrapper.java	(working copy)
+@@ -29,16 +29,17 @@
+ import java.util.ArrayList;
+ import java.util.HashSet;
+ import java.util.Set;
+-import java.util.List;
+ 
++import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.BlockLocation;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.io.Text;
+-import org.apache.hadoop.mapred.InputSplit;
+-import org.apache.hadoop.mapred.JobConf;
+-import org.apache.hadoop.mapred.RecordReader;
++import org.apache.hadoop.io.Writable;
++import org.apache.hadoop.mapreduce.InputSplit;
++import org.apache.hadoop.mapreduce.RecordReader;
++import org.apache.hadoop.mapreduce.TaskAttemptContext;
+ import org.apache.pig.ExecType;
+ import org.apache.pig.PigException;
+ import org.apache.pig.Slice;
+@@ -47,7 +48,6 @@
+ import org.apache.pig.backend.executionengine.PigSlice;
+ import org.apache.pig.backend.hadoop.datastorage.ConfigurationUtil;
+ import org.apache.pig.backend.hadoop.datastorage.HDataStorage;
+-import org.apache.pig.data.TargetedTuple;
+ import org.apache.pig.data.Tuple;
+ import org.apache.pig.data.TupleFactory;
+ import org.apache.pig.impl.PigContext;
+@@ -57,13 +57,13 @@
+ /**
+  * Wraps a {@link Slice} in an {@link InputSplit} so it's usable by hadoop.
+  */
+-public class SliceWrapper implements InputSplit {
++public class SliceWrapper extends InputSplit implements Writable {
+ 
+     private int index;
+     private ExecType execType;
+     private Slice wrapped;
+     private transient FileSystem fs;// transient so it isn't serialized
+-    private transient JobConf lastConf;
++    private transient Configuration lastConf;
+     private ArrayList<OperatorKey> targetOps;
+ 
+     public SliceWrapper() {
+@@ -113,56 +113,69 @@
+         
+     }
+ 
+-    public JobConf getJobConf() {
++    public Configuration getJobConf() {
+         return lastConf;
+     }
+ 
+-    public RecordReader<Text, Tuple> makeReader(JobConf job) throws IOException {
+-        lastConf = job;        
+-        DataStorage store = new HDataStorage(ConfigurationUtil.toProperties(job));
++    public RecordReader<Text, Tuple> makeReader(Configuration conf) throws IOException {
++        lastConf = conf;        
++        DataStorage store = new HDataStorage(ConfigurationUtil.toProperties(conf));
+         // if the execution is against Mapred DFS, set
+         // working dir to /user/<userid>
+         if(execType == ExecType.MAPREDUCE)
+-            store.setActiveContainer(store.asContainer("/user/" + job.getUser()));
+-        PigContext.setPackageImportList((ArrayList<String>)ObjectSerializer.deserialize(job.get("udf.import.list")));
++            store.setActiveContainer(store.asContainer("/user/" + conf.get("user.name")));
++        PigContext.setPackageImportList((ArrayList<String>)ObjectSerializer.deserialize(conf.get("udf.import.list")));
+         wrapped.init(store);
++                       
++        conf.set("map.target.ops", ObjectSerializer.serialize(targetOps));       
+         
+-        job.set("map.target.ops", ObjectSerializer.serialize(targetOps));
+         // Mimic org.apache.hadoop.mapred.FileSplit if feasible...
+         String[] locations = wrapped.getLocations();
+         if (locations.length > 0) {
+-            job.set("map.input.file", locations[0]);    
+-            job.setLong("map.input.start", wrapped.getStart());   
+-            job.setLong("map.input.length", wrapped.getLength());
++        	conf.set("map.input.file", locations[0]);    
++        	conf.setLong("map.input.start", wrapped.getStart());   
++        	conf.setLong("map.input.length", wrapped.getLength());
+         }
+         
+-        return new RecordReader<Text, Tuple>() {
++        return new TupleReader();
++    }
++    
++    public class TupleReader extends RecordReader<Text, Tuple> {
++    	private Tuple current;
+ 
+-            TupleFactory tupFac = TupleFactory.getInstance();
+-            public void close() throws IOException {
+-                wrapped.close();
+-            }
++        TupleFactory tupFac = TupleFactory.getInstance();
++        public void close() throws IOException {
++            wrapped.close();
++        } 
+ 
+-            public Text createKey() {
+-                return null; // we never use the key!
+-            }
++        public float getProgress() throws IOException {
++            return wrapped.getProgress();
++        }
+ 
+-            public Tuple createValue() {
+-                return tupFac.newTuple();
+-            }
++		@Override
++		public Text getCurrentKey() throws IOException, InterruptedException {			
++			return null;
++		}
+ 
+-            public long getPos() throws IOException {
+-                return wrapped.getPos();
+-            }
++		@Override
++		public Tuple getCurrentValue() throws IOException, InterruptedException {			
++			return current;
++		}
+ 
+-            public float getProgress() throws IOException {
+-                return wrapped.getProgress();
+-            }
++		@Override
++		public void initialize(InputSplit inputsplit, 
++				TaskAttemptContext taskattemptcontext) throws IOException, InterruptedException {			
++			
++		}
+ 
+-            public boolean next(Text key, Tuple value) throws IOException {
+-                return wrapped.next(value);
+-            }
+-        };
++		@Override
++		public boolean nextKeyValue() throws IOException, InterruptedException {
++			Tuple t = tupFac.newTuple();
++			boolean result = wrapped.next(t);
++			current = t;
++			
++			return result;
++		}
+     }
+ 
+     public void readFields(DataInput is) throws IOException {
+Index: src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/DistinctCombiner.java
+===================================================================
+--- src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/DistinctCombiner.java	(revision 815927)
++++ src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/DistinctCombiner.java	(working copy)
+@@ -23,11 +23,7 @@
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.io.Writable;
+-import org.apache.hadoop.mapred.JobConf;
+-import org.apache.hadoop.mapred.MapReduceBase;
+-import org.apache.hadoop.mapred.OutputCollector;
+-import org.apache.hadoop.mapred.Reducer;
+-import org.apache.hadoop.mapred.Reporter;
++import org.apache.hadoop.mapreduce.Reducer;
+ 
+ import org.apache.pig.impl.io.PigNullableWritable;
+ import org.apache.pig.impl.io.NullableTuple;
+@@ -39,8 +35,7 @@
+  */
+ public class DistinctCombiner {
+ 
+-    public static class Combine extends MapReduceBase
+-            implements
++    public static class Combine extends 
+             Reducer<PigNullableWritable, NullableTuple, PigNullableWritable, Writable> {
+         private final Log log = LogFactory.getLog(getClass());
+ 
+@@ -50,25 +45,23 @@
+          * Configures the reporter 
+          */
+         @Override
+-        public void configure(JobConf jConf) {
+-            super.configure(jConf);
++        protected void setup(Context context) throws IOException, InterruptedException {
++            super.setup(context);
+             pigReporter = new ProgressableReporter();
+         }
+         
+         /**
+          * The reduce function which removes values.
+          */
+-        public void reduce(PigNullableWritable key,
+-                Iterator<NullableTuple> tupIter,
+-                OutputCollector<PigNullableWritable, Writable> oc,
+-                Reporter reporter) throws IOException {
++        protected void reduce(PigNullableWritable key, Iterable<NullableTuple> tupIter, Context context) throws IOException, InterruptedException {
+             
+-            pigReporter.setRep(reporter);
++            pigReporter.setRep(context);
+ 
+             // Take the first value and the key and collect
+             // just that.
+-            NullableTuple val = tupIter.next();
+-            oc.collect(key, val);
++            Iterator<NullableTuple> iter = tupIter.iterator();
++            NullableTuple val = iter.next();
++            context.write(key, val);
+         }
+     }
+     
+Index: src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/MapReducePOStoreImpl.java
+===================================================================
+--- src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/MapReducePOStoreImpl.java	(revision 815927)
++++ src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/MapReducePOStoreImpl.java	(working copy)
+@@ -27,26 +27,26 @@
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ 
++import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+-import org.apache.hadoop.mapred.FileOutputFormat;
+-import org.apache.hadoop.mapred.JobConf;
+-import org.apache.hadoop.mapred.OutputFormat;
+-import org.apache.hadoop.mapred.RecordWriter;
+-import org.apache.hadoop.mapred.OutputCollector;
+-import org.apache.hadoop.mapred.Reporter;
++import org.apache.hadoop.mapreduce.RecordWriter;
++import org.apache.hadoop.mapreduce.JobContext;
++import org.apache.hadoop.mapreduce.OutputFormat;
++import org.apache.hadoop.mapreduce.TaskAttemptContext;
++import org.apache.hadoop.mapreduce.TaskInputOutputContext;
++import org.apache.hadoop.util.Progressable;
++import org.apache.hadoop.util.ReflectionUtils;
+ 
+ import org.apache.pig.StoreConfig;
+ import org.apache.pig.StoreFunc;
+ import org.apache.pig.impl.PigContext;
+-import org.apache.pig.impl.io.FileLocalizer;
+ import org.apache.pig.impl.io.FileSpec;
+ import org.apache.pig.impl.logicalLayer.schema.Schema;
+ import org.apache.pig.impl.util.ObjectSerializer;
+ 
+ import org.apache.pig.backend.hadoop.executionengine.physicalLayer.util.PlanHelper;
+ import org.apache.pig.backend.hadoop.executionengine.physicalLayer.relationalOperators.POStoreImpl;
+-import org.apache.pig.backend.hadoop.executionengine.mapReduceLayer.PigOutputFormat;
+ 
+ /**
+  * This class is used to have a POStore write to DFS via a output
+@@ -59,31 +59,29 @@
+  * reduce function.
+  */
+ public class MapReducePOStoreImpl extends POStoreImpl {
+-
+-    private PigContext pc;
+-    private StoreFunc storer;
+-    private FileSpec sFile;
+-    private Reporter reporter;
++    
++    private Progressable reporter;
+     private RecordWriter writer;
+-    private JobConf job;
++    private TaskInputOutputContext job;
+ 
+     private final Log log = LogFactory.getLog(getClass());
+     public static final String PIG_STORE_CONFIG = "pig.store.config";
+     
+-    public MapReducePOStoreImpl(JobConf job) {
+-        this.job = job;
++    public MapReducePOStoreImpl(JobContext job) {
++        this.job = (TaskInputOutputContext)job;
+     }
+ 
+-    public void setReporter(Reporter reporter) {
++    public void setReporter(Progressable reporter) {
+         this.reporter = reporter;
+     }
+ 
+     @Override
+     public StoreFunc createStoreFunc(FileSpec sFile, Schema schema) 
+         throws IOException {
++    	
++    	Configuration outputConf = job.getConfiguration();
+ 
+-        // set up a new job conf
+-        JobConf outputConf = new JobConf(job);
++        // set up a new job conf      
+         String tmpPath = PlanHelper.makeStoreTmpPath(sFile.getFileName());
+ 
+         // If the StoreFunc associate with the POStore is implements
+@@ -102,9 +100,9 @@
+             sPrepClass = null;
+         }
+         if(sPrepClass != null && OutputFormat.class.isAssignableFrom(sPrepClass)) {
+-            outputConf.setOutputFormat(sPrepClass);
++        	outputConf.setClass("mapred.output.format.class", sPrepClass, OutputFormat.class);
+         } else {
+-            outputConf.setOutputFormat(PigOutputFormat.class);
++        	outputConf.setClass("mapred.output.format.class", OutputFormat.class, null);
+         }
+ 
+         // PigOuputFormat will look for pig.storeFunc to actually
+@@ -132,42 +130,48 @@
+         String workPath = outputConf.get("mapred.work.output.dir");
+         outputConf.set("mapred.work.output.dir",
+                        new Path(workPath, tmpPath).toString());
+-        OutputFormat outputFormat = outputConf.getOutputFormat();
+-
+-        // Generate a unique part name (part-<task_partition_number>).
+-        String fileName = getPartName(outputConf);
+         
+-        // create a new record writer
+-        writer = outputFormat.getRecordWriter(FileSystem.get(outputConf), 
+-                                              outputConf, fileName, reporter);
++        OutputFormat outputFormat = null;
++        try {
++        	Class c = job.getOutputFormatClass();        
++        	outputFormat = (OutputFormat)ReflectionUtils.newInstance(c, outputConf);
++          
++            // create a new record writer
++            writer = outputFormat.getRecordWriter((TaskAttemptContext)job);
++        }catch(Exception e) {
++        	throw new IOException(e);
++        }
+ 
++
+         // return an output collector using the writer we just created.
+-        return new StoreFuncAdaptor(new OutputCollector() 
+-            {
+-                @SuppressWarnings({"unchecked"})
+-                public void collect(Object key, Object value) throws IOException {
+-                    writer.write(key,value);
+-                }
+-            });
++        return new StoreFuncAdaptor(job);
+     }
+ 
+     @Override
+     public void tearDown() throws IOException{
+         if (writer != null) {
+-            writer.close(reporter);
+-            writer = null;
++        	try{
++        		writer.close(job);
++        		writer = null;
++        	}catch(Exception e) {
++        		//
++        	}
+         }
+     }
+ 
+     @Override
+     public void cleanUp() throws IOException{
+         if (writer != null) {
+-            writer.close(reporter);
+-            writer = null;
++        	try{
++        		writer.close(job);
++        		writer = null;
++        	}catch(Exception e) {
++        		
++        	}
+         }
+     }
+ 
+-    private String getPartName(JobConf conf) {
++    private String getPartName(Configuration conf) {
+         int partition = conf.getInt("mapred.task.partition", -1);   
+ 
+         NumberFormat numberFormat = NumberFormat.getInstance();
+@@ -183,26 +187,30 @@
+      * collector instead of an output stream to write tuples.
+      */
+     private class StoreFuncAdaptor implements StoreFunc {
+-        private OutputCollector collector;
++        private TaskInputOutputContext collector;
+         
+-        public StoreFuncAdaptor(OutputCollector collector) {
++        public StoreFuncAdaptor(TaskInputOutputContext collector) {
+             this.collector = collector;
+         }
+         
+-        @Override
++
+         public void bindTo(OutputStream os) throws IOException {
+         }
+         
+-        @Override
++
+         public void putNext(Tuple f) throws IOException {
+-            collector.collect(null,f);
++        	try{
++        		collector.write(null,f);
++        	}catch(Exception e) {
++        		throw new IOException(e);
++        	}
+         }
+         
+-        @Override
++
+         public void finish() throws IOException {
+         }
+ 
+-        @Override
++
+         public Class getStorePreparationClass() throws IOException {
+             return null;
+         }
+Index: src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/PigMapReduce.java
+===================================================================
+--- src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/PigMapReduce.java	(revision 815927)
++++ src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/PigMapReduce.java	(working copy)
+@@ -25,14 +25,11 @@
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+-import org.apache.hadoop.io.Text;
++import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.io.Writable;
+-import org.apache.hadoop.mapred.JobConf;
+-import org.apache.hadoop.mapred.MapReduceBase;
+-import org.apache.hadoop.mapred.Mapper;
+ import org.apache.hadoop.mapred.OutputCollector;
+-import org.apache.hadoop.mapred.Reducer;
+-import org.apache.hadoop.mapred.Reporter;
++import org.apache.hadoop.mapreduce.JobContext;
++import org.apache.hadoop.mapreduce.Reducer;
+ import org.apache.log4j.PropertyConfigurator;
+ 
+ import org.apache.pig.PigException;
+@@ -48,7 +45,6 @@
+ import org.apache.pig.backend.hadoop.executionengine.physicalLayer.relationalOperators.POStore;
+ import org.apache.pig.backend.hadoop.executionengine.physicalLayer.util.PlanHelper;
+ import org.apache.pig.data.DataType;
+-import org.apache.pig.data.TargetedTuple;
+ import org.apache.pig.data.Tuple;
+ import org.apache.pig.impl.PigContext;
+ import org.apache.pig.impl.io.PigNullableWritable;
+@@ -57,7 +53,6 @@
+ import org.apache.pig.impl.plan.VisitorException;
+ import org.apache.pig.impl.util.ObjectSerializer;
+ import org.apache.pig.impl.util.SpillableMemoryManager;
+-import org.apache.pig.impl.util.WrappedIOException;
+ 
+ import org.apache.pig.data.DataBag;
+ import org.apache.pig.impl.io.NullablePartitionWritable;
+@@ -87,14 +82,14 @@
+  */
+ public class PigMapReduce {
+ 
+-    public static JobConf sJobConf = null;
++    public static JobContext sJobContext = null;
++    public static Configuration sJobConf = null;
+     private final static Tuple DUMMYTUPLE = null;
+     
+-    public static class Map extends PigMapBase implements
+-            Mapper<Text, Tuple, PigNullableWritable, Writable> {
++    public static class Map extends PigMapBase {
+ 
+         @Override
+-        public void collect(OutputCollector<PigNullableWritable, Writable> oc, Tuple tuple) throws ExecException, IOException {
++        public void collect(Context oc, Tuple tuple) throws ExecException, IOException {
+             Byte index = (Byte)tuple.get(0);
+             PigNullableWritable key =
+                 HDataType.getWritableComparableTypes(tuple.get(1), keyType);
+@@ -105,7 +100,11 @@
+             // assign the tuple to its slot in the projection.
+             key.setIndex(index);
+             val.setIndex(index);
+-            oc.collect(key, val);
++            try {            	
++            	oc.write(key, val);
++            }catch(Exception e) {
++            	throw new IOException(e);
++            }
+         }
+     }
+     
+@@ -115,12 +114,10 @@
+      * to be handed tuples. Hence this map class ensures that the "key" used
+      * in the order by is wrapped into a tuple (if it isn't already a tuple)
+      */
+-    public static class MapWithComparator extends PigMapBase implements
+-            Mapper<Text, Tuple, PigNullableWritable, Writable> {
++    public static class MapWithComparator extends PigMapBase {
+ 
+         @Override
+-        public void collect(OutputCollector<PigNullableWritable, Writable> oc,
+-                Tuple tuple) throws ExecException, IOException {
++        public void collect(Context oc, Tuple tuple) throws ExecException, IOException {
+             Object keyTuple = null;
+             if(keyType != DataType.TUPLE) {
+                 Object k = tuple.get(1);
+@@ -140,18 +137,21 @@
+             // assign the tuple to its slot in the projection.
+             key.setIndex(index);
+             val.setIndex(index);
+-            oc.collect(key, val);
++            try {
++            	oc.write(key, val);
++            }catch(Exception e) {
++            	throw new IOException(e);
++            }
+         }
+     }
+ 
+ 	/**
+ 	 * Used by Skewed Join
+ 	 */
+-    public static class MapWithPartitionIndex extends Map implements
+-            Mapper<Text, Tuple, PigNullableWritable, Writable> {    	
++    public static class MapWithPartitionIndex extends Map {    	
+ 
+         @Override
+-        public void collect(OutputCollector<PigNullableWritable, Writable> oc, Tuple tuple) throws ExecException, IOException {			
++        public void collect(Context oc, Tuple tuple) throws ExecException, IOException {			
+ 			Byte tupleKeyIdx = 2;
+ 			Byte tupleValIdx = 3;
+ 
+@@ -183,8 +183,11 @@
+ 			// set the partition
+ 			wrappedKey.setPartition(partitionIndex);
+ 			val.setIndex(index);
+-            oc.collect(wrappedKey, val);
+-            //oc.collect(key, val);
++			try{
++				oc.write(wrappedKey, val);
++			}catch(Exception e) {
++				throw new IOException(e);
++			}           
+         }
+ 
+ 		@Override
+@@ -235,9 +238,7 @@
+ 		}
+ 	}
+ 
+-    public static class Reduce extends MapReduceBase
+-            implements
+-            Reducer<PigNullableWritable, NullableTuple, PigNullableWritable, Writable> {
++    public static class Reduce extends Reducer <PigNullableWritable, NullableTuple, PigNullableWritable, Writable>{
+         protected final Log log = LogFactory.getLog(getClass());
+         
+         //The reduce plan
+@@ -255,7 +256,7 @@
+         
+         ProgressableReporter pigReporter;
+ 
+-        protected OutputCollector<PigNullableWritable, Writable> outputCollector;
++        protected Context outputCollector;
+ 
+         protected boolean errorInReduce = false;
+         
+@@ -271,10 +272,14 @@
+          * and the reporter thread
+          */
+         @Override
+-        public void configure(JobConf jConf) {
+-            super.configure(jConf);
++
++     	protected void setup(Context context) throws IOException, InterruptedException {
++            super.setup(context);
++            
++            Configuration jConf = context.getConfiguration();
+             SpillableMemoryManager.configure(ConfigurationUtil.toProperties(jConf));
+-            sJobConf = jConf;
++            sJobContext = context;
++            sJobConf = context.getConfiguration();
+             try {
+                 PigContext.setPackageImportList((ArrayList<String>)ObjectSerializer.deserialize(jConf.get("udf.import.list")));
+                 pigContext = (PigContext)ObjectSerializer.deserialize(jConf.get("pig.pigContext"));
+@@ -314,37 +319,34 @@
+          * into key, Bag&lt;Tuple&gt; after converting Hadoop type key into Pig type.
+          * The package result is either collected as is, if the reduce plan is
+          * empty or after passing through the reduce plan.
+-         */
+-        public void reduce(PigNullableWritable key,
+-                Iterator<NullableTuple> tupIter,
+-                OutputCollector<PigNullableWritable, Writable> oc,
+-                Reporter reporter) throws IOException {
+-            
+-            if (!initialized) {
++         */       
++        protected void reduce(PigNullableWritable key, Iterable<NullableTuple> tupIter, Context context) throws IOException, InterruptedException {            
++        	if (!initialized) {
+                 initialized = true;
+                 
+                 // cache the collector for use in runPipeline()
+                 // which could additionally be called from close()
+-                this.outputCollector = oc;
+-                pigReporter.setRep(reporter);
++                this.outputCollector = context;
++                pigReporter.setRep(context);
+                 PhysicalOperator.setReporter(pigReporter);
+ 
+                 boolean aggregateWarning = "true".equalsIgnoreCase(pigContext.getProperties().getProperty("aggregate.warning"));
+ 	        
+                 PigHadoopLogger pigHadoopLogger = PigHadoopLogger.getInstance();
+                 pigHadoopLogger.setAggregate(aggregateWarning);
+-                pigHadoopLogger.setReporter(reporter);
++                pigHadoopLogger.setReporter(context);
++                
+                 PhysicalOperator.setPigLogger(pigHadoopLogger);
+ 
+                 for (POStore store: stores) {
+                     MapReducePOStoreImpl impl 
+-                        = new MapReducePOStoreImpl(PigMapReduce.sJobConf);
+-                    impl.setReporter(reporter);
++                        = new MapReducePOStoreImpl(PigMapReduce.sJobContext);
++                    impl.setReporter(context);
+                     store.setStoreImpl(impl);
+                     store.setUp();
+                 }
+             }
+-
++          
+             // In the case we optimize the join, we combine
+             // POPackage and POForeach - so we could get many
+             // tuples out of the getnext() call of POJoinPackage
+@@ -352,24 +354,24 @@
+             // POJoinPacakage.getNext()
+             if (pack instanceof POJoinPackage)
+             {
+-                pack.attachInput(key, tupIter);
++                pack.attachInput(key, tupIter.iterator());
+                 while (true)
+                 {
+-                    if (processOnePackageOutput(oc))
++                    if (processOnePackageOutput(context))
+                         break;
+                 }
+             }
+             else {
+                 // join is not optimized, so package will
+                 // give only one tuple out for the key
+-                pack.attachInput(key, tupIter);
+-                processOnePackageOutput(oc);
+-            }
++                pack.attachInput(key, tupIter.iterator());
++                processOnePackageOutput(context);
++            } 
+         }
+         
+         // return: false-more output
+         //         true- end of processing
+-        public boolean processOnePackageOutput(OutputCollector<PigNullableWritable, Writable> oc) throws IOException
++        public boolean processOnePackageOutput(Context oc) throws IOException
+         {
+             try {
+                 Result res = pack.getNext(DUMMYTUPLE);
+@@ -377,7 +379,7 @@
+                     Tuple packRes = (Tuple)res.result;
+                     
+                     if(rp.isEmpty()){
+-                        oc.collect(null, packRes);
++                        oc.write(null, packRes);
+                         return false;
+                     }
+                     for (int i = 0; i < roots.length; i++) {
+@@ -402,8 +404,9 @@
+                 }
+                     
+                 return false;
+-            } catch (ExecException e) {
+-                throw e;
++            } catch (Exception e) {
++            	e.printStackTrace();
++                throw new IOException(e);
+             }
+         }
+         
+@@ -417,7 +420,11 @@
+             {
+                 Result redRes = leaf.getNext(DUMMYTUPLE);
+                 if(redRes.returnStatus==POStatus.STATUS_OK){
+-                   	outputCollector.collect(null, (Tuple)redRes.result);
++                	try{
++                		outputCollector.write(null, (Tuple)redRes.result);
++                	}catch(Exception e) {
++                		throw new IOException(e);
++                	}
+                     continue;
+                 }
+                 
+@@ -454,8 +461,9 @@
+          * processed. So right place to stop the reporter thread.
+          */
+         @Override
+-        public void close() throws IOException {
+-            super.close();
++        
++        protected void cleanup(Context context) throws IOException, InterruptedException {
++            super.cleanup(context);
+             
+             if(errorInReduce) {
+                 // there was an error in reduce - just return
+@@ -480,7 +488,7 @@
+             for (POStore store: stores) {
+                 if (!initialized) {
+                     MapReducePOStoreImpl impl 
+-                        = new MapReducePOStoreImpl(PigMapReduce.sJobConf);
++                        = new MapReducePOStoreImpl(PigMapReduce.sJobContext);
+                     store.setStoreImpl(impl);
+                     store.setUp();
+                 }
+@@ -518,8 +526,8 @@
+          * and the reporter thread
+          */
+         @Override
+-        public void configure(JobConf jConf) {
+-            super.configure(jConf);
++        protected void setup(Context context) throws IOException, InterruptedException {
++            super.setup(context);
+             keyType = pack.getKeyType();
+         }
+ 
+@@ -529,31 +537,30 @@
+          * The package result is either collected as is, if the reduce plan is
+          * empty or after passing through the reduce plan.
+          */
+-        public void reduce(PigNullableWritable key,
+-                Iterator<NullableTuple> tupIter,
+-                OutputCollector<PigNullableWritable, Writable> oc,
+-                Reporter reporter) throws IOException {
++        protected void reduce(PigNullableWritable key, Iterable<NullableTuple> tupIter, Context context) 
++		throws IOException, InterruptedException {
+             
+             if (!initialized) {
+                 initialized = true;
+                 
+                 // cache the collector for use in runPipeline()
+                 // which could additionally be called from close()
+-                this.outputCollector = oc;
+-                pigReporter.setRep(reporter);
++                this.outputCollector = context;
++                pigReporter.setRep(context);
+                 PhysicalOperator.setReporter(pigReporter);
+ 
+                 boolean aggregateWarning = "true".equalsIgnoreCase(pigContext.getProperties().getProperty("aggregate.warning"));
+                 
+                 PigHadoopLogger pigHadoopLogger = PigHadoopLogger.getInstance();
+                 pigHadoopLogger.setAggregate(aggregateWarning);
+-                pigHadoopLogger.setReporter(reporter);
++                pigHadoopLogger.setReporter(context);
+                 PhysicalOperator.setPigLogger(pigHadoopLogger);
+                 
+                 for (POStore store: stores) {
+                     MapReducePOStoreImpl impl 
+-                        = new MapReducePOStoreImpl(PigMapReduce.sJobConf);
+-                    impl.setReporter(reporter);
++                        = new MapReducePOStoreImpl(PigMapReduce.sJobContext);
++                    
++                    impl.setReporter(context);
+                     store.setStoreImpl(impl);
+                     store.setUp();
+                 }
+@@ -573,7 +580,7 @@
+                 }
+             }
+             
+-            pack.attachInput(key, tupIter);
++            pack.attachInput(key, tupIter.iterator());
+             
+             try {
+                 Result res = pack.getNext(DUMMYTUPLE);
+@@ -581,7 +588,7 @@
+                     Tuple packRes = (Tuple)res.result;
+                     
+                     if(rp.isEmpty()){
+-                        oc.collect(null, packRes);
++                        context.write(null, packRes);
+                         return;
+                     }
+                     
+@@ -611,5 +618,5 @@
+         }
+ 
+     }
+-    
++   
+ }
+Index: src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/PigMapBase.java
+===================================================================
+--- src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/PigMapBase.java	(revision 815927)
++++ src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/PigMapBase.java	(working copy)
+@@ -19,17 +19,17 @@
+ 
+ import java.io.ByteArrayOutputStream;
+ import java.io.IOException;
+-import java.util.ArrayList;
+-import java.util.List;
++import java.util.*;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.io.Text;
+ import org.apache.hadoop.io.Writable;
+-import org.apache.hadoop.mapred.JobConf;
+-import org.apache.hadoop.mapred.MapReduceBase;
+ import org.apache.hadoop.mapred.OutputCollector;
+ import org.apache.hadoop.mapred.Reporter;
++import org.apache.hadoop.mapreduce.Mapper;
++import org.apache.hadoop.mapreduce.Mapper.Context;
+ import org.apache.log4j.PropertyConfigurator;
+ import org.apache.pig.PigException;
+ import org.apache.pig.backend.executionengine.ExecException;
+@@ -50,7 +50,7 @@
+ import org.apache.pig.impl.util.ObjectSerializer;
+ import org.apache.pig.impl.util.SpillableMemoryManager;
+ 
+-public abstract class PigMapBase extends MapReduceBase{
++public abstract class PigMapBase extends Mapper<Text, Tuple, PigNullableWritable, Writable>{
+     private static final Tuple DUMMYTUPLE = null;
+ 
+     private final Log log = LogFactory.getLog(getClass());
+@@ -66,7 +66,7 @@
+ 
+     protected TupleFactory tf = TupleFactory.getInstance();
+     
+-    OutputCollector<PigNullableWritable, Writable> outputCollector;
++    Context outputCollector;
+     
+     // Reporter that will be used by operators
+     // to transmit heartbeat
+@@ -86,9 +86,8 @@
+      * are done. So reporter thread should be closed.
+      */
+     @Override
+-    public void close() throws IOException {
+-        super.close();
+-
++    public void cleanup(Context context) throws IOException, InterruptedException {
++        super.cleanup(context);
+         if(errorInMap) {
+             //error in map - returning
+             return;
+@@ -112,7 +111,7 @@
+         for (POStore store: stores) {
+             if (!initialized) {
+                 MapReducePOStoreImpl impl 
+-                    = new MapReducePOStoreImpl(PigMapReduce.sJobConf);
++                    = new MapReducePOStoreImpl(PigMapReduce.sJobContext);
+                 store.setStoreImpl(impl);
+                 store.setUp();
+             }
+@@ -140,10 +139,13 @@
+      * reproter thread
+      */
+     @Override
+-    public void configure(JobConf job) {
+-        super.configure(job);
++    public void setup(Context context) throws IOException, InterruptedException{       	
++        super.setup(context);
++        
++        Configuration job = context.getConfiguration();
+         SpillableMemoryManager.configure(ConfigurationUtil.toProperties(job));
+-        PigMapReduce.sJobConf = job;
++        PigMapReduce.sJobContext = context;
++        PigMapReduce.sJobConf = context.getConfiguration();
+         try {
+             PigContext.setPackageImportList((ArrayList<String>)ObjectSerializer.deserialize(job.get("udf.import.list")));
+             pigContext = (PigContext)ObjectSerializer.deserialize(job.get("pig.pigContext"));
+@@ -169,6 +171,7 @@
+             
+             pigReporter = new ProgressableReporter();
+             if(!(mp.isEmpty())) {
++   
+                 List<OperatorKey> targetOpKeys = 
+                     (ArrayList<OperatorKey>)ObjectSerializer.deserialize(job.get("map.target.ops"));
+                 ArrayList<PhysicalOperator> targetOpsAsList = new ArrayList<PhysicalOperator>();
+@@ -176,7 +179,7 @@
+                     targetOpsAsList.add(mp.getOperator(targetKey));
+                 }
+                 roots = targetOpsAsList.toArray(new PhysicalOperator[1]);
+-                leaf = mp.getLeaves().get(0);
++                leaf = mp.getLeaves().get(0);               
+             }
+             
+             
+@@ -195,23 +198,20 @@
+      * map-only or map-reduce job to implement. Map-only collects
+      * the tuple as-is whereas map-reduce collects it after extracting
+      * the key and indexed tuple.
+-     */
+-    public void map(Text key, Tuple inpTuple,
+-            OutputCollector<PigNullableWritable, Writable> oc,
+-            Reporter reporter) throws IOException {
+-        
+-        if(!initialized) {
++     */   
++    protected void map(Text key, Tuple inpTuple, Context context) throws IOException, InterruptedException {     
++    	if(!initialized) {
+             initialized  = true;
+             // cache the collector for use in runPipeline() which
+             // can be called from close()
+-            this.outputCollector = oc;
+-            pigReporter.setRep(reporter);
++            this.outputCollector = context;
++            pigReporter.setRep(context);
+             PhysicalOperator.setReporter(pigReporter);
+ 
+             for (POStore store: stores) {
+                 MapReducePOStoreImpl impl 
+-                    = new MapReducePOStoreImpl(PigMapReduce.sJobConf);
+-                impl.setReporter(reporter);
++                    = new MapReducePOStoreImpl(PigMapReduce.sJobContext);
++                impl.setReporter(context);
+                 store.setStoreImpl(impl);
+                 store.setUp();
+             }
+@@ -220,13 +220,13 @@
+ 
+             PigHadoopLogger pigHadoopLogger = PigHadoopLogger.getInstance();
+             pigHadoopLogger.setAggregate(aggregateWarning);
+-            pigHadoopLogger.setReporter(reporter);
++            pigHadoopLogger.setReporter(context);
+             PhysicalOperator.setPigLogger(pigHadoopLogger);
+         }
+         
+         if(mp.isEmpty()){
+             try{
+-                collect(oc,inpTuple);
++                collect(context,inpTuple);
+             } catch (ExecException e) {
+                 throw e;
+             }
+@@ -281,7 +281,7 @@
+         
+     }
+ 
+-    abstract public void collect(OutputCollector<PigNullableWritable, Writable> oc, Tuple tuple) throws ExecException, IOException;
++    abstract public void collect(Context oc, Tuple tuple) throws ExecException, IOException;
+ 
+     /**
+      * @return the keyType
+Index: src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/PigHadoopLogger.java
+===================================================================
+--- src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/PigHadoopLogger.java	(revision 815927)
++++ src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/PigHadoopLogger.java	(working copy)
+@@ -19,9 +19,8 @@
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+-import org.apache.hadoop.mapred.Reporter;
++import org.apache.hadoop.util.Progressable;
+ import org.apache.pig.backend.hadoop.executionengine.physicalLayer.PigLogger;
+-import org.apache.pig.backend.hadoop.executionengine.physicalLayer.PigProgressable;
+ 
+ /**
+  * 
+@@ -40,7 +39,7 @@
+ 	}	
+ 
+ 	private static Log log = LogFactory.getLog(PigHadoopLogger.class);
+-	private Reporter reporter = null;
++	private Progressable reporter = null;
+ 	private boolean aggregate = false;
+ 
+     private PigHadoopLogger() {
+@@ -50,7 +49,7 @@
+     	String displayMessage = o.getClass().getName() + ": " + msg;
+     	if(aggregate) {
+     		if(reporter != null) {
+-    			reporter.incrCounter(warningEnum, 1);
++    			//reporter.incrCounter(warningEnum, 1);
+     		} else {
+     			//TODO:    			
+     			//in local mode of execution if the PigHadoopLogger is used initially,
+@@ -67,11 +66,11 @@
+     	}
+     }    
+ 
+-    public Reporter getReporter() {
++    public Progressable getReporter() {
+         return reporter;
+     }
+ 
+-    public synchronized void setReporter(Reporter rep) {
++    public synchronized void setReporter(Progressable rep) {
+     		this.reporter = rep;
+     }
+     
+Index: src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/ProgressableReporter.java
+===================================================================
+--- src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/ProgressableReporter.java	(revision 815927)
++++ src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/ProgressableReporter.java	(working copy)
+@@ -18,16 +18,17 @@
+ package org.apache.pig.backend.hadoop.executionengine.mapReduceLayer;
+ 
+ import org.apache.hadoop.mapred.Reporter;
++import org.apache.hadoop.util.Progressable;
+ import org.apache.pig.backend.hadoop.executionengine.physicalLayer.PigProgressable;
+ 
+ public class ProgressableReporter implements PigProgressable {
+-    Reporter rep;
++	Progressable rep;
+     
+     public ProgressableReporter(){
+         
+     }
+     
+-    public ProgressableReporter(Reporter rep) {
++    public ProgressableReporter(Progressable rep) {
+         super();
+         this.rep = rep;
+     }
+@@ -38,10 +39,10 @@
+     }
+ 
+     public void progress(String msg) {
+-        rep.setStatus(msg);
++        //rep.setStatus(msg);
+     }
+ 
+-    public void setRep(Reporter rep) {
++    public void setRep(Progressable rep) {
+         this.rep = rep;
+     }
+ 
+Index: src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/PigMapOnly.java
+===================================================================
+--- src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/PigMapOnly.java	(revision 815927)
++++ src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/PigMapOnly.java	(working copy)
+@@ -19,16 +19,10 @@
+ 
+ import java.io.ByteArrayOutputStream;
+ import java.io.IOException;
+-import java.util.List;
+-
+-import org.apache.commons.logging.Log;
+-import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.io.Text;
+ import org.apache.hadoop.io.Writable;
+ import org.apache.hadoop.io.WritableComparable;
+-import org.apache.hadoop.mapred.JobConf;
+-import org.apache.hadoop.mapred.MapReduceBase;
+-import org.apache.hadoop.mapred.Mapper;
++import org.apache.hadoop.mapreduce.Mapper;
+ import org.apache.hadoop.mapred.OutputCollector;
+ import org.apache.hadoop.mapred.Reporter;
+ import org.apache.pig.backend.executionengine.ExecException;
+@@ -62,12 +56,15 @@
+ 
+ public class PigMapOnly {
+ 
+-    public static class Map extends PigMapBase implements
+-            Mapper<Text, Tuple, PigNullableWritable, Writable> {
++    public static class Map extends  PigMapBase  {
+ 
+         @Override
+-        public void collect(OutputCollector<PigNullableWritable, Writable> oc, Tuple tuple) throws ExecException, IOException {
+-            oc.collect(null, tuple);
++        public void collect(Context oc, Tuple tuple) throws ExecException, IOException {
++        	try{
++        		oc.write(null, tuple);
++        	}catch(Exception e) {
++        		throw new IOException(e);
++        	}
+         }
+     }
+ }
+Index: src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/MapReduceLauncher.java
+===================================================================
+--- src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/MapReduceLauncher.java	(revision 815927)
++++ src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/MapReduceLauncher.java	(working copy)
+@@ -30,10 +30,11 @@
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.mapred.Counters;
+ import org.apache.hadoop.mapred.JobClient;
+-import org.apache.hadoop.mapred.JobID;
++import org.apache.hadoop.mapreduce.JobID;
+ import org.apache.hadoop.mapred.RunningJob;
+-import org.apache.hadoop.mapred.jobcontrol.Job;
+-import org.apache.hadoop.mapred.jobcontrol.JobControl;
++import org.apache.hadoop.mapreduce.Job;
++import org.apache.hadoop.mapreduce.lib.jobcontrol.ControlledJob;
++import org.apache.hadoop.mapreduce.lib.jobcontrol.JobControl;
+ import org.apache.pig.PigException;
+ import org.apache.pig.PigWarning;
+ import org.apache.pig.backend.executionengine.ExecException;
+@@ -107,12 +108,13 @@
+         ExecutionEngine exe = pc.getExecutionEngine();
+         ConfigurationValidator.validatePigProperties(exe.getConfiguration());
+         Configuration conf = ConfigurationUtil.toConfiguration(exe.getConfiguration());
++        
+         JobClient jobClient = ((HExecutionEngine)exe).getJobClient();
+ 
+         JobControlCompiler jcc = new JobControlCompiler(pc, conf);
+         
+-        List<Job> failedJobs = new LinkedList<Job>();
+-        List<Job> succJobs = new LinkedList<Job>();
++        List<ControlledJob> failedJobs = new LinkedList<ControlledJob>();
++        List<ControlledJob> succJobs = new LinkedList<ControlledJob>();
+         JobControl jc;
+         int totalMRJobs = mrp.size();
+         int numMRJobsCompl = 0;
+@@ -124,7 +126,7 @@
+         JobControlThreadExceptionHandler jctExceptionHandler = new JobControlThreadExceptionHandler();
+ 
+         while((jc = jcc.compile(mrp, grpName)) != null) {
+-            numMRJobsCurrent = jc.getWaitingJobs().size();
++            numMRJobsCurrent = jc.getWaitingJobList().size();
+ 
+             Thread jcThread = new Thread(jc);
+             jcThread.setUncaughtExceptionHandler(jctExceptionHandler);
+@@ -162,7 +164,7 @@
+             }
+ 
+             numMRJobsCompl += numMRJobsCurrent;
+-            failedJobs.addAll(jc.getFailedJobs());
++            failedJobs.addAll(jc.getFailedJobList());
+ 
+             if (!failedJobs.isEmpty() 
+                 && "true".equalsIgnoreCase(
+@@ -170,7 +172,7 @@
+                 int errCode = 6017;
+                 StringBuilder msg = new StringBuilder("Execution failed, while processing ");
+                 
+-                for (Job j: failedJobs) {
++                for (ControlledJob j: failedJobs) {
+                     List<POStore> sts = jcc.getStores(j);
+                     for (POStore st: sts) {
+                         msg.append(st.getSFile().getFileName());
+@@ -182,7 +184,7 @@
+                                         errCode, PigException.REMOTE_ENVIRONMENT);
+             }
+ 
+-            List<Job> jobs = jc.getSuccessfulJobs();
++            List<ControlledJob> jobs = jc.getSuccessfulJobList();
+             jcc.moveResults(jobs);
+             succJobs.addAll(jobs);
+             
+@@ -203,7 +205,7 @@
+             log.error(failedJobs.size()+" map reduce job(s) failed!");
+             Exception backendException = null;
+ 
+-            for (Job fj : failedJobs) {
++            for (ControlledJob fj : failedJobs) {
+                 
+                 try {
+                     getStats(fj, jobClient, true, pc);
+@@ -229,7 +231,7 @@
+         Map<Enum, Long> warningAggMap = new HashMap<Enum, Long>();
+                 
+         if(succJobs!=null) {
+-            for(Job job : succJobs){
++            for(ControlledJob job : succJobs){
+                 List<POStore> sts = jcc.getStores(job);
+                 for (POStore st: sts) {
+                     if (!st.isTmpStore()) {
+@@ -243,7 +245,7 @@
+                     computeWarningAggregate(job, jobClient, warningAggMap);
+                 }
+             }
+-        }
++        } 
+         
+         if(aggregateWarning) {
+             CompilationMessageCollector.logAggregate(warningAggMap, MessageType.Warning, log) ;
+@@ -396,8 +398,8 @@
+     	}
+     }
+     
+-    void computeWarningAggregate(Job job, JobClient jobClient, Map<Enum, Long> aggMap) {
+-    	JobID mapRedJobID = job.getAssignedJobID();
++    void computeWarningAggregate(ControlledJob job, JobClient jobClient, Map<Enum, Long> aggMap) {
++    	String mapRedJobID = job.getJobID();
+     	RunningJob runningJob = null;
+     	try {
+     		runningJob = jobClient.getJob(mapRedJobID);
+Index: src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/PigCombiner.java
+===================================================================
+--- src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/PigCombiner.java	(revision 815927)
++++ src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/PigCombiner.java	(working copy)
+@@ -25,13 +25,14 @@
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.io.Text;
+ import org.apache.hadoop.io.Writable;
+-import org.apache.hadoop.mapred.JobConf;
+-import org.apache.hadoop.mapred.MapReduceBase;
+-import org.apache.hadoop.mapred.Mapper;
++
+ import org.apache.hadoop.mapred.OutputCollector;
+-import org.apache.hadoop.mapred.Reducer;
++import org.apache.hadoop.mapreduce.JobContext;
++import org.apache.hadoop.mapreduce.Reducer;
++import org.apache.hadoop.mapreduce.Reducer.Context;
+ import org.apache.hadoop.mapred.Reporter;
+ import org.apache.log4j.PropertyConfigurator;
+ 
+@@ -58,11 +59,9 @@
+ 
+ public class PigCombiner {
+ 
+-    public static JobConf sJobConf = null;
++    public static JobContext sJobContext = null;
+     
+-    public static class Combine extends MapReduceBase
+-            implements
+-            Reducer<PigNullableWritable, NullableTuple, PigNullableWritable, Writable> {
++    public static class Combine extends Reducer<PigNullableWritable, NullableTuple, PigNullableWritable, Writable> {
+         private final Log log = LogFactory.getLog(getClass());
+ 
+         private final static Tuple DUMMYTUPLE = null;
+@@ -92,9 +91,10 @@
+          * and the reporter thread
+          */
+         @Override
+-        public void configure(JobConf jConf) {
+-            super.configure(jConf);
+-            sJobConf = jConf;
++        protected void setup(Context context) throws IOException, InterruptedException {
++            super.setup(context);
++            sJobContext = context;
++            Configuration jConf = context.getConfiguration();
+             try {
+                 PigContext.setPackageImportList((ArrayList<String>)ObjectSerializer.deserialize(jConf.get("udf.import.list")));
+                 pigContext = (PigContext)ObjectSerializer.deserialize(jConf.get("pig.pigContext"));
+@@ -135,21 +135,18 @@
+          * The package result is either collected as is, if the reduce plan is
+          * empty or after passing through the reduce plan.
+          */
+-        public void reduce(PigNullableWritable key,
+-                Iterator<NullableTuple> tupIter,
+-                OutputCollector<PigNullableWritable, Writable> oc,
+-                Reporter reporter) throws IOException {
+-            
++       
++        protected void reduce(PigNullableWritable key, Iterable<NullableTuple> tupIter, Context context) throws IOException, InterruptedException {        	
+         	if(!initialized) {
+         		initialized = true;
+-	            pigReporter.setRep(reporter);	            
++	            pigReporter.setRep(context);	            
+ 	            PhysicalOperator.setReporter(pigReporter);
+ 
+ 	            boolean aggregateWarning = "true".equalsIgnoreCase(pigContext.getProperties().getProperty("aggregate.warning"));
+ 
+ 	            PigHadoopLogger pigHadoopLogger = PigHadoopLogger.getInstance();
+ 	            pigHadoopLogger.setAggregate(aggregateWarning);
+-	            pigHadoopLogger.setReporter(reporter);
++	            pigHadoopLogger.setReporter(context);
+ 	            PhysicalOperator.setPigLogger(pigHadoopLogger);
+         	}
+             
+@@ -160,32 +157,36 @@
+             // POJoinPacakage.getNext()
+             if (pack instanceof POJoinPackage)
+             {
+-                pack.attachInput(key, tupIter);
++                pack.attachInput(key, tupIter.iterator());
+                 while (true)
+                 {
+-                    if (processOnePackageOutput(oc))
++                    if (processOnePackageOutput(context))
+                         break;
+                 }
+             }
+             else {
+                 // not optimized, so package will
+                 // give only one tuple out for the key
+-                pack.attachInput(key, tupIter);
+-                processOnePackageOutput(oc);
++                pack.attachInput(key, tupIter.iterator());
++                processOnePackageOutput(context);
+             }
+             
+         }
+         
+         // return: false-more output
+         //         true- end of processing
+-        public boolean processOnePackageOutput(OutputCollector<PigNullableWritable, Writable> oc) throws IOException {
++        public boolean processOnePackageOutput(Context oc) throws IOException {
+             try {
+                 Result res = pack.getNext(DUMMYTUPLE);
+                 if(res.returnStatus==POStatus.STATUS_OK){
+                     Tuple packRes = (Tuple)res.result;
+                     
+                     if(cp.isEmpty()){
+-                        oc.collect(null, packRes);
++                    	try{
++                    		oc.write(null, packRes);
++                    	}catch(Exception e) {
++                    		throw new IOException(e);
++                    	}
+                         return false;
+                     }
+                     
+@@ -208,7 +209,12 @@
+                             // assign the tuple to its slot in the projection.
+                             outKey.setIndex(index);
+                             val.setIndex(index);
+-                            oc.collect(outKey, val);
++                            try{
++                            	oc.write(outKey, val);
++                        	}catch(Exception e) {
++                        		throw new IOException(e);
++                        	}
++
+                             continue;
+                         }
+                         
+@@ -255,9 +261,9 @@
+          * Will be called once all the intermediate keys and values are
+          * processed. So right place to stop the reporter thread.
+          */
+-        @Override
+-        public void close() throws IOException {
+-            super.close();
++        @Override        
++        protected void cleanup(Context context) throws IOException, InterruptedException {        	
++            super.cleanup(context);
+         }
+ 
+         /**
+Index: src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/Launcher.java
+===================================================================
+--- src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/Launcher.java	(revision 815927)
++++ src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/Launcher.java	(working copy)
+@@ -29,22 +29,15 @@
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+-import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.mapred.JobClient;
+-import org.apache.hadoop.mapred.JobID;
+ import org.apache.hadoop.mapred.RunningJob;
+ import org.apache.hadoop.mapred.TaskReport;
+-import org.apache.hadoop.mapred.jobcontrol.Job;
+-import org.apache.hadoop.mapred.jobcontrol.JobControl;
++import org.apache.hadoop.mapreduce.lib.jobcontrol.ControlledJob;
++import org.apache.hadoop.mapreduce.lib.jobcontrol.JobControl;
+ import org.apache.pig.FuncSpec;
+ import org.apache.pig.PigException;
+ import org.apache.pig.backend.executionengine.ExecException;
+-import org.apache.pig.backend.executionengine.ExecutionEngine;
+-import org.apache.pig.backend.hadoop.datastorage.HConfiguration;
+-import org.apache.pig.backend.hadoop.executionengine.HExecutionEngine;
+ import org.apache.pig.impl.PigContext;
+-import org.apache.pig.backend.hadoop.executionengine.mapReduceLayer.plans.MROperPlan;
+-import org.apache.pig.backend.hadoop.executionengine.physicalLayer.PhysicalOperator;
+ import org.apache.pig.backend.hadoop.executionengine.physicalLayer.plans.PhysicalPlan;
+ import org.apache.pig.impl.plan.PlanException;
+ import org.apache.pig.impl.plan.VisitorException;
+@@ -157,10 +150,11 @@
+         return (int)(Math.ceil(prog)) == (int)1;
+     }
+     
+-    protected void getStats(Job job, JobClient jobClient, boolean errNotDbg, PigContext pigContext) throws Exception {
+-        JobID MRJobID = job.getAssignedJobID();
++    protected void getStats(ControlledJob job, JobClient jobClient, boolean errNotDbg, PigContext pigContext) throws Exception {
++    	String MRJobID = job.getJobID();
+         String jobMessage = job.getMessage();
+         Exception backendException = null;
++     
+         if(MRJobID == null) {
+             try {
+                 LogUtils.writeLog("Backend error message during job submission", jobMessage, 
+@@ -184,7 +178,7 @@
+             getErrorMessages(redRep, "reduce", errNotDbg, pigContext);
+             totalHadoopTimeSpent += computeTimeSpent(mapRep);
+         } catch (IOException e) {
+-            if(job.getState() == Job.SUCCESS) {
++            if(job.getJobState() == ControlledJob.State.SUCCESS) {
+                 // if the job succeeded, let the user know that
+                 // we were unable to get statistics
+                 log.warn("Unable to get job related diagnostics");
+@@ -276,11 +270,11 @@
+      */
+     protected double calculateProgress(JobControl jc, JobClient jobClient) throws IOException{
+         double prog = 0.0;
+-        prog += jc.getSuccessfulJobs().size();
++        prog += jc.getSuccessfulJobList().size();
+         
+-        List runnJobs = jc.getRunningJobs();
++        List runnJobs = jc.getRunningJobList();
+         for (Object object : runnJobs) {
+-            Job j = (Job)object;
++            ControlledJob j = (ControlledJob)object;
+             prog += progressOfRunningJob(j, jobClient);
+         }
+         return prog;
+@@ -296,10 +290,10 @@
+      * @return Returns the percentage progress of this Job
+      * @throws IOException
+      */
+-    protected double progressOfRunningJob(Job j, JobClient jobClient) throws IOException{
+-        JobID mrJobID = j.getAssignedJobID();
++    protected double progressOfRunningJob(ControlledJob j, JobClient jobClient) throws IOException{
++        String mrJobID = j.getJobID();
+         RunningJob rj = jobClient.getJob(mrJobID);
+-        if(rj==null && j.getState()==Job.SUCCESS)
++        if(rj==null && j.getJobState()== ControlledJob.State.SUCCESS)
+             return 1;
+         else if(rj==null)
+             return 0;
+Index: src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/partitioners/SkewedPartitioner.java
+===================================================================
+--- src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/partitioners/SkewedPartitioner.java	(revision 815927)
++++ src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/partitioners/SkewedPartitioner.java	(working copy)
+@@ -18,34 +18,16 @@
+ package org.apache.pig.backend.hadoop.executionengine.mapReduceLayer.partitioners;
+ 
+ 
+-import java.io.InputStream;
+-import java.util.ArrayList;
+-import java.util.Arrays;
+ import java.util.HashMap;
+-import java.util.Iterator;
+ import java.util.Map;
+-import java.util.Map.Entry;
+ 
+-import org.apache.hadoop.io.RawComparator;
++
++import org.apache.hadoop.conf.Configurable;
++import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.io.Writable;
+-import org.apache.hadoop.mapred.JobConf;
+-import org.apache.hadoop.mapred.Partitioner;
++import org.apache.hadoop.mapreduce.Partitioner;
+ import org.apache.pig.backend.executionengine.ExecException;
+-import org.apache.pig.backend.hadoop.HDataType;
+-import org.apache.pig.backend.hadoop.datastorage.ConfigurationUtil;
+-import org.apache.pig.builtin.BinStorage;
+-import org.apache.pig.data.DataBag;
+ import org.apache.pig.data.Tuple;
+-import org.apache.pig.data.TupleFactory;
+-import org.apache.pig.impl.builtin.FindQuantiles;
+-import org.apache.pig.impl.io.BufferedPositionedInputStream;
+-import org.apache.pig.impl.io.FileLocalizer;
+-import org.apache.pig.impl.io.NullableBytesWritable;
+-import org.apache.pig.impl.io.NullableDoubleWritable;
+-import org.apache.pig.impl.io.NullableFloatWritable;
+-import org.apache.pig.impl.io.NullableIntWritable;
+-import org.apache.pig.impl.io.NullableLongWritable;
+-import org.apache.pig.impl.io.NullableText;
+ import org.apache.pig.impl.io.NullableTuple;
+ import org.apache.pig.impl.io.PigNullableWritable;
+ import org.apache.pig.impl.io.NullablePartitionWritable;
+@@ -62,11 +44,12 @@
+   * For ex: if the key distribution file contains (k1, 5, 3) as an entry, reducers from 5 to 3 are returned 
+   * in a round robin manner.
+   */ 
+-public class SkewedPartitioner implements Partitioner<PigNullableWritable, Writable> {
++public class SkewedPartitioner extends Partitioner<PigNullableWritable, Writable> implements Configurable {
+ 	Map<Tuple, Pair<Integer, Integer> > reducerMap = new HashMap<Tuple, Pair<Integer, Integer> >();
+ 	static Map<Tuple, Integer> currentIndexMap = new HashMap<Tuple, Integer> ();
+ 	Integer totalReducers;
+-
++    Configuration conf;
++	
+     public int getPartition(PigNullableWritable wrappedKey, Writable value,
+             int numPartitions) {
+ 		// for streaming tables, return the partition index blindly
+@@ -115,7 +98,8 @@
+ 	}
+ 
+     @SuppressWarnings("unchecked")
+-    public void configure(JobConf job) {
++    public void setConf(Configuration job) {
++    	conf = job;
+         String keyDistFile = job.get("pig.keyDistFile", "");
+         if (keyDistFile.length() == 0)
+             throw new RuntimeException(this.getClass().getSimpleName() + " used but no key distribution found");
+@@ -129,4 +113,10 @@
+ 		}
+ 	}
+ 
++	public Configuration getConf() {
++		return conf;
++	}
++
++	
++
+ }
+Index: src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/partitioners/WeightedRangePartitioner.java
+===================================================================
+--- src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/partitioners/WeightedRangePartitioner.java	(revision 815927)
++++ src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/partitioners/WeightedRangePartitioner.java	(working copy)
+@@ -26,13 +26,16 @@
+ import java.util.Map;
+ import java.util.Map.Entry;
+ 
++import org.apache.hadoop.conf.Configurable;
++import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.io.RawComparator;
+ import org.apache.hadoop.io.Writable;
+ import org.apache.hadoop.mapred.JobConf;
+-import org.apache.hadoop.mapred.Partitioner;
++import org.apache.hadoop.mapreduce.Partitioner;
+ import org.apache.pig.backend.executionengine.ExecException;
+ import org.apache.pig.backend.hadoop.HDataType;
+ import org.apache.pig.backend.hadoop.datastorage.ConfigurationUtil;
++import org.apache.pig.backend.hadoop.executionengine.mapReduceLayer.PigMapReduce;
+ import org.apache.pig.builtin.BinStorage;
+ import org.apache.pig.data.DataBag;
+ import org.apache.pig.data.InternalMap;
+@@ -50,16 +53,21 @@
+ import org.apache.pig.impl.io.NullableTuple;
+ import org.apache.pig.impl.io.PigNullableWritable;
+ 
+-public class WeightedRangePartitioner implements Partitioner<PigNullableWritable, Writable> {
++public class WeightedRangePartitioner extends Partitioner<PigNullableWritable, Writable>   
++			implements Configurable {
+     PigNullableWritable[] quantiles;
+     RawComparator<PigNullableWritable> comparator;
+     Integer numQuantiles;
+     DataBag samples;
+     public static Map<PigNullableWritable,DiscreteProbabilitySampleGenerator> weightedParts = new HashMap<PigNullableWritable, DiscreteProbabilitySampleGenerator>();
+-    JobConf job;
++    Configuration job;
+ 
+     public int getPartition(PigNullableWritable key, Writable value,
+-            int numPartitions){
++            int numPartitions){ 	
++    	if (comparator == null) {
++    	       comparator = (RawComparator<PigNullableWritable>)PigMapReduce.sJobContext.getSortComparator();
++    	}
++    	
+         if(!weightedParts.containsKey(key)){
+             int index = Arrays.binarySearch(quantiles, key, comparator);
+             if (index < 0)
+@@ -73,11 +81,12 @@
+     }
+ 
+     @SuppressWarnings("unchecked")
+-    public void configure(JobConf job) {
+-        this.job = job;
++   public void setConf(Configuration configuration) {
++		job = configuration;
++		
+         String quantilesFile = job.get("pig.quantilesFile", "");
+-        comparator = job.getOutputKeyComparator();
+-        if (quantilesFile.length() == 0)
++
++         if (quantilesFile.length() == 0)
+             throw new RuntimeException(this.getClass().getSimpleName() + " used but no quantiles found");
+         
+         try{
+@@ -179,4 +188,10 @@
+         }
+         return list;
+     }
++
++	public Configuration getConf() {
++		return job;
++	}
++
++	
+ }
+Index: src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/JobControlCompiler.java
+===================================================================
+--- src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/JobControlCompiler.java	(revision 815927)
++++ src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/JobControlCompiler.java	(working copy)
+@@ -28,17 +28,17 @@
+ import org.apache.commons.logging.LogFactory;
+ 
+ import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.filecache.DistributedCache;
++import org.apache.hadoop.mapreduce.filecache.DistributedCache;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.io.WritableComparable;
+ import org.apache.hadoop.io.WritableComparator;
+-import org.apache.hadoop.mapred.FileOutputFormat;
+-import org.apache.hadoop.mapred.JobConf;
+-import org.apache.hadoop.mapred.OutputFormat;
+-import org.apache.hadoop.mapred.jobcontrol.Job;
+-import org.apache.hadoop.mapred.jobcontrol.JobControl;
++import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
++import org.apache.hadoop.mapreduce.lib.jobcontrol.ControlledJob;
++import org.apache.hadoop.mapreduce.lib.jobcontrol.JobControl;
++import org.apache.hadoop.mapreduce.Job;
++import org.apache.hadoop.mapreduce.OutputFormat;
+ 
+ import org.apache.pig.ComparisonFunc;
+ import org.apache.pig.FuncSpec;
+@@ -113,18 +113,18 @@
+     public static final String END_OF_INP_IN_MAP = "pig.invoke.close.in.map";
+     
+     // A mapping of job to pair of store locations and tmp locations for that job
+-    private Map<Job, Pair<List<POStore>, Path>> jobStoreMap;
++    private Map<ControlledJob, Pair<List<POStore>, Path>> jobStoreMap;
+ 
+     public JobControlCompiler(PigContext pigContext, Configuration conf) throws IOException {
+         this.pigContext = pigContext;
+         this.conf = conf;
+-        jobStoreMap = new HashMap<Job, Pair<List<POStore>, Path>>();
++        jobStoreMap = new HashMap<ControlledJob, Pair<List<POStore>, Path>>();
+     }
+ 
+     /**
+      * Returns all store locations of a previously compiled job
+      */
+-    public List<POStore> getStores(Job job) {
++    public List<POStore> getStores(ControlledJob job) {
+         Pair<List<POStore>, Path> pair = jobStoreMap.get(job);
+         if (pair != null && pair.first != null) {
+             return pair.first;
+@@ -137,7 +137,7 @@
+      * Resets the state
+      */
+     public void reset() {
+-        jobStoreMap = new HashMap<Job, Pair<List<POStore>, Path>>();
++        jobStoreMap = new HashMap<ControlledJob, Pair<List<POStore>, Path>>();
+     }
+ 
+     /**
+@@ -149,8 +149,8 @@
+      * This method should always be called after the job execution
+      * completes.
+      */
+-    public void moveResults(List<Job> completedJobs) throws IOException {
+-        for (Job job: completedJobs) {
++    public void moveResults(List<ControlledJob> completedJobs) throws IOException {
++        for (ControlledJob job: completedJobs) {
+             Pair<List<POStore>, Path> pair = jobStoreMap.get(job);
+             if (pair != null && pair.second != null) {
+                 Path tmp = pair.second;
+@@ -277,8 +277,17 @@
+      * @return Job corresponding to mro
+      * @throws JobCreationException
+      */
+-    private Job getJob(MapReduceOper mro, Configuration conf, PigContext pigContext) throws JobCreationException{
+-        JobConf jobConf = new JobConf(conf);
++    private ControlledJob getJob(MapReduceOper mro, Configuration config, PigContext pigContext) throws JobCreationException{    	
++        Job job = null;
++        
++        try{
++        	job = new Job(config);        
++        }catch(Exception e) {
++        	throw new JobCreationException(e);
++        }
++        
++        Configuration conf = job.getConfiguration();
++        
+         ArrayList<Pair<FileSpec, Boolean>> inp = new ArrayList<Pair<FileSpec, Boolean>>();
+         ArrayList<List<OperatorKey>> inpTargets = new ArrayList<List<OperatorKey>>();
+         ArrayList<POStore> storeLocations = new ArrayList<POStore>();
+@@ -286,11 +295,22 @@
+         
+         //Set the User Name for this job. This will be
+         //used as the working directory
+-        String user = System.getProperty("user.name");
+-        jobConf.setUser(user != null ? user : "Pigster");
++        String user = System.getProperty("user.name");        
++        conf.set("user.name", (user != null ? user : "Pigster"));
+         if (pigContext.defaultParallel > 0)
+-            jobConf.set("mapred.reduce.tasks", ""+pigContext.defaultParallel);
+-
++            conf.set("mapred.reduce.tasks", ""+pigContext.defaultParallel);
++ 
++        conf.set("mapred.mapper.new-api", "true");
++        conf.set("mapred.reducer.new-api", "true");
++        
++        String buffPercent = conf.get("mapred.job.reduce.markreset.buffer.percent");
++        if (buffPercent == null || Double.parseDouble(buffPercent) <= 0) {
++        	log.info("mapred.job.reduce.markreset.buffer.percent is not set, set to default 0.3");
++        	conf.set("mapred.job.reduce.markreset.buffer.percent", "0.3");
++        }else{
++        	log.info("mapred.job.reduce.markreset.buffer.percent is set to " + conf.get("mapred.job.reduce.markreset.buffer.percent"));
++        }        
++                
+         try{        
+             //Process the POLoads
+             List<POLoad> lds = PlanHelper.getLoads(mro.mapPlan);
+@@ -325,22 +345,22 @@
+             JarManager.createJar(fos, mro.UDFs, pigContext);
+             
+             //Start setting the JobConf properties
+-            jobConf.setJar(submitJarFile.getPath());
+-            jobConf.set("pig.inputs", ObjectSerializer.serialize(inp));
+-            jobConf.set("pig.inpTargets", ObjectSerializer.serialize(inpTargets));
+-            jobConf.set("pig.pigContext", ObjectSerializer.serialize(pigContext));
+-            jobConf.set("udf.import.list", ObjectSerializer.serialize(PigContext.getPackageImportList()));
++            conf.set("mapred.jar", submitJarFile.getPath());
++            conf.set("pig.inputs", ObjectSerializer.serialize(inp));
++            conf.set("pig.inpTargets", ObjectSerializer.serialize(inpTargets));
++            conf.set("pig.pigContext", ObjectSerializer.serialize(pigContext));
++            conf.set("udf.import.list", ObjectSerializer.serialize(PigContext.getPackageImportList()));
+             // this is for unit tests since some don't create PigServer
+             if (pigContext.getProperties().getProperty(PigContext.JOB_NAME) != null)
+-                jobConf.setJobName(pigContext.getProperties().getProperty(PigContext.JOB_NAME));
++                job.setJobName(pigContext.getProperties().getProperty(PigContext.JOB_NAME));
+     
+             // Setup the DistributedCache for this job
+-            setupDistributedCache(pigContext, jobConf, pigContext.getProperties(), 
++            setupDistributedCache(pigContext, job.getConfiguration(), pigContext.getProperties(), 
+                                   "pig.streaming.ship.files", true);
+-            setupDistributedCache(pigContext, jobConf, pigContext.getProperties(), 
++            setupDistributedCache(pigContext, job.getConfiguration(), pigContext.getProperties(), 
+                                   "pig.streaming.cache.files", false);
+ 
+-            jobConf.setInputFormat(PigInputFormat.class);
++            job.setInputFormatClass(PigInputFormat.class);
+             
+             //Process POStore and remove it from the plan
+             List<POStore> mapStores = PlanHelper.getStores(mro.mapPlan);
+@@ -383,15 +403,15 @@
+                     sPrepClass = null;
+                 }
+                 if(sPrepClass != null && OutputFormat.class.isAssignableFrom(sPrepClass)) {
+-                    jobConf.setOutputFormat(sPrepClass);
++                    job.setOutputFormatClass(sPrepClass);
+                 } else {
+-                    jobConf.setOutputFormat(PigOutputFormat.class);
++                    job.setOutputFormatClass(PigOutputFormat.class);
+                 }
+                 
+                 //set out filespecs
+                 String outputPath = st.getSFile().getFileName();
+                 FuncSpec outputFuncSpec = st.getSFile().getFuncSpec();
+-                FileOutputFormat.setOutputPath(jobConf, new Path(outputPath));
++                FileOutputFormat.setOutputPath(job, new Path(outputPath));
+                 
+                 // serialize the store func spec using ObjectSerializer
+                 // ObjectSerializer.serialize() uses default java serialization
+@@ -399,13 +419,13 @@
+                 // get encoded as regular characters. Otherwise any control characters
+                 // in the store funcspec would break the job.xml which is created by
+                 // hadoop from the jobconf.
+-                jobConf.set("pig.storeFunc", ObjectSerializer.serialize(outputFuncSpec.toString()));
+-                jobConf.set(PIG_STORE_CONFIG, 
++                conf.set("pig.storeFunc", ObjectSerializer.serialize(outputFuncSpec.toString()));
++                conf.set(PIG_STORE_CONFIG, 
+                             ObjectSerializer.serialize(new StoreConfig(outputPath, st.getSchema())));
+ 
+-                jobConf.set("pig.streaming.log.dir", 
++                conf.set("pig.streaming.log.dir", 
+                             new Path(outputPath, LOG_DIR).toString());
+-                jobConf.set("pig.streaming.task.output.dir", outputPath);
++                conf.set("pig.streaming.task.output.dir", outputPath);
+             } 
+            else { // multi store case
+                 log.info("Setting up multi store job");
+@@ -420,18 +440,18 @@
+                     fs.mkdirs(tmpOut);
+                 }
+ 
+-                jobConf.setOutputFormat(PigOutputFormat.class);
+-                FileOutputFormat.setOutputPath(jobConf, tmpLocation);
++                job.setOutputFormatClass(PigOutputFormat.class);
++                FileOutputFormat.setOutputPath(job, tmpLocation);
+ 
+-                jobConf.set("pig.streaming.log.dir", 
++                conf.set("pig.streaming.log.dir", 
+                             new Path(tmpLocation, LOG_DIR).toString());
+-                jobConf.set("pig.streaming.task.output.dir", tmpLocation.toString());
++                conf.set("pig.streaming.task.output.dir", tmpLocation.toString());
+            }
+ 
+             // store map key type
+             // this is needed when the key is null to create
+             // an appropriate NullableXXXWritable object
+-            jobConf.set("pig.map.keytype", ObjectSerializer.serialize(new byte[] { mro.mapKeyType }));
++            conf.set("pig.map.keytype", ObjectSerializer.serialize(new byte[] { mro.mapKeyType }));
+ 
+             // set parent plan in all operators in map and reduce plans
+             // currently the parent plan is really used only when POStream is present in the plan
+@@ -441,14 +461,14 @@
+             POPackage pack = null;
+             if(mro.reducePlan.isEmpty()){
+                 //MapOnly Job
+-                jobConf.setMapperClass(PigMapOnly.Map.class);
+-                jobConf.setNumReduceTasks(0);
+-                jobConf.set("pig.mapPlan", ObjectSerializer.serialize(mro.mapPlan));
++                job.setMapperClass(PigMapOnly.Map.class);
++                job.setNumReduceTasks(0);
++                conf.set("pig.mapPlan", ObjectSerializer.serialize(mro.mapPlan));
+                 if(mro.isEndOfAllInputSetInMap()) {
+                     // this is used in Map.close() to decide whether the
+                     // pipeline needs to be rerun one more time in the close()
+                     // The pipeline is rerun if there either was a stream or POMergeJoin
+-                    jobConf.set(END_OF_INP_IN_MAP, "true");
++                    conf.set(END_OF_INP_IN_MAP, "true");
+                 }
+             }
+             else{
+@@ -457,76 +477,76 @@
+                 if(!mro.combinePlan.isEmpty()){
+                     POPackage combPack = (POPackage)mro.combinePlan.getRoots().get(0);
+                     mro.combinePlan.remove(combPack);
+-                    jobConf.setCombinerClass(PigCombiner.Combine.class);
+-                    jobConf.set("pig.combinePlan", ObjectSerializer.serialize(mro.combinePlan));
+-                    jobConf.set("pig.combine.package", ObjectSerializer.serialize(combPack));
++                    job.setCombinerClass(PigCombiner.Combine.class);
++                    conf.set("pig.combinePlan", ObjectSerializer.serialize(mro.combinePlan));
++                    conf.set("pig.combine.package", ObjectSerializer.serialize(combPack));
+                 } else if (mro.needsDistinctCombiner()) {
+-                    jobConf.setCombinerClass(DistinctCombiner.Combine.class);
++                    job.setCombinerClass(DistinctCombiner.Combine.class);
+                     log.info("Setting identity combiner class.");
+                 }
+                 pack = (POPackage)mro.reducePlan.getRoots().get(0);
+                 mro.reducePlan.remove(pack);
+-                jobConf.setMapperClass(PigMapReduce.Map.class);
+-                jobConf.setReducerClass(PigMapReduce.Reduce.class);
++                job.setMapperClass(PigMapReduce.Map.class);
++                job.setReducerClass(PigMapReduce.Reduce.class);
+                 if (mro.requestedParallelism>0)
+-                    jobConf.setNumReduceTasks(mro.requestedParallelism);
++                    job.setNumReduceTasks(mro.requestedParallelism);
+ 
+-                jobConf.set("pig.mapPlan", ObjectSerializer.serialize(mro.mapPlan));
++                conf.set("pig.mapPlan", ObjectSerializer.serialize(mro.mapPlan));
+                 if(mro.isEndOfAllInputSetInMap()) {
+                     // this is used in Map.close() to decide whether the
+                     // pipeline needs to be rerun one more time in the close()
+                     // The pipeline is rerun only if there was a stream or merge-join.
+-                    jobConf.set(END_OF_INP_IN_MAP, "true");
++                    conf.set(END_OF_INP_IN_MAP, "true");
+                 }
+-                jobConf.set("pig.reducePlan", ObjectSerializer.serialize(mro.reducePlan));
++                conf.set("pig.reducePlan", ObjectSerializer.serialize(mro.reducePlan));
+                 if(mro.isEndOfAllInputSetInReduce()) {
+                     // this is used in Map.close() to decide whether the
+                     // pipeline needs to be rerun one more time in the close()
+                     // The pipeline is rerun only if there was a stream
+-                    jobConf.set("pig.stream.in.reduce", "true");
++                    conf.set("pig.stream.in.reduce", "true");
+                 }
+-                jobConf.set("pig.reduce.package", ObjectSerializer.serialize(pack));
++                conf.set("pig.reduce.package", ObjectSerializer.serialize(pack));
+                 Class<? extends WritableComparable> keyClass = HDataType.getWritableComparableTypes(pack.getKeyType()).getClass();
+-                jobConf.setOutputKeyClass(keyClass);
+-                jobConf.set("pig.reduce.key.type", Byte.toString(pack.getKeyType())); 
+-                selectComparator(mro, pack.getKeyType(), jobConf);
+-                jobConf.setOutputValueClass(NullableTuple.class);
++                job.setOutputKeyClass(keyClass);
++                conf.set("pig.reduce.key.type", Byte.toString(pack.getKeyType())); 
++                selectComparator(mro, pack.getKeyType(), job);
++                job.setOutputValueClass(NullableTuple.class);
+             }
+         
+             if(mro.isGlobalSort() || mro.isLimitAfterSort()){
+                 // Only set the quantiles file and sort partitioner if we're a
+                 // global sort, not for limit after sort.
+                 if (mro.isGlobalSort()) {
+-                    jobConf.set("pig.quantilesFile", mro.getQuantFile());
+-                    jobConf.setPartitionerClass(WeightedRangePartitioner.class);
++                    conf.set("pig.quantilesFile", mro.getQuantFile());
++                    job.setPartitionerClass(WeightedRangePartitioner.class);
+                 }
+                 if(mro.UDFs.size()==1){
+                     String compFuncSpec = mro.UDFs.get(0);
+                     Class comparator = PigContext.resolveClassName(compFuncSpec);
+                     if(ComparisonFunc.class.isAssignableFrom(comparator)) {
+-                        jobConf.setMapperClass(PigMapReduce.MapWithComparator.class);
+-                        jobConf.setReducerClass(PigMapReduce.ReduceWithComparator.class);
+-                        jobConf.set("pig.reduce.package", ObjectSerializer.serialize(pack));
+-                        jobConf.set("pig.usercomparator", "true");
+-                        jobConf.setOutputKeyClass(NullableTuple.class);
+-                        jobConf.setOutputKeyComparatorClass(comparator);
++                        job.setMapperClass(PigMapReduce.MapWithComparator.class);
++                        job.setReducerClass(PigMapReduce.ReduceWithComparator.class);
++                        conf.set("pig.reduce.package", ObjectSerializer.serialize(pack));
++                        conf.set("pig.usercomparator", "true");
++                        job.setOutputKeyClass(NullableTuple.class);                          
++                        job.setSortComparatorClass(comparator);
+                     }
+                 } else {
+-                    jobConf.set("pig.sortOrder",
++                    conf.set("pig.sortOrder",
+                         ObjectSerializer.serialize(mro.getSortOrder()));
+                 }
+             }
+             
+             if (mro.isSkewedJoin()) {
+-            	jobConf.set("pig.keyDistFile", mro.getSkewedJoinPartitionFile());
+-            	jobConf.setPartitionerClass(SkewedPartitioner.class);
+-            	jobConf.setMapperClass(PigMapReduce.MapWithPartitionIndex.class);
+-				jobConf.setMapOutputKeyClass(NullablePartitionWritable.class);
++            	conf.set("pig.keyDistFile", mro.getSkewedJoinPartitionFile());
++            	job.setPartitionerClass(SkewedPartitioner.class);
++            	job.setMapperClass(PigMapReduce.MapWithPartitionIndex.class);
++				job.setMapOutputKeyClass(NullablePartitionWritable.class);
+             }
+-            
+-            Job job = new Job(jobConf);
+-            jobStoreMap.put(job,new Pair(storeLocations, tmpLocation));
+-            return job;
++                        
++            ControlledJob cjob = new ControlledJob(job, new ArrayList());
++            jobStoreMap.put(cjob,new Pair(storeLocations, tmpLocation));
++            return cjob;
+         } catch (JobCreationException jce) {
+         	throw jce;
+         } catch(Exception e) {
+@@ -605,7 +625,7 @@
+     private void selectComparator(
+             MapReduceOper mro,
+             byte keyType,
+-            JobConf jobConf) throws JobCreationException {
++            Job job) throws JobCreationException {
+         // If this operator is involved in an order by, use the pig specific raw
+         // comparators.  If it has a cogroup, we need to set the comparator class
+         // to the raw comparator and the grouping comparator class to pig specific
+@@ -627,28 +647,28 @@
+         }
+         if (hasOrderBy) {
+             switch (keyType) {
+-            case DataType.INTEGER:
+-                jobConf.setOutputKeyComparatorClass(PigIntRawComparator.class);
++            case DataType.INTEGER:            	
++                job.setSortComparatorClass(PigIntRawComparator.class);               
+                 break;
+ 
+             case DataType.LONG:
+-                jobConf.setOutputKeyComparatorClass(PigLongRawComparator.class);
++                job.setSortComparatorClass(PigLongRawComparator.class);               
+                 break;
+ 
+             case DataType.FLOAT:
+-                jobConf.setOutputKeyComparatorClass(PigFloatRawComparator.class);
++                job.setSortComparatorClass(PigFloatRawComparator.class);
+                 break;
+ 
+             case DataType.DOUBLE:
+-                jobConf.setOutputKeyComparatorClass(PigDoubleRawComparator.class);
++                job.setSortComparatorClass(PigDoubleRawComparator.class);
+                 break;
+ 
+             case DataType.CHARARRAY:
+-                jobConf.setOutputKeyComparatorClass(PigTextRawComparator.class);
++                job.setSortComparatorClass(PigTextRawComparator.class);
+                 break;
+ 
+             case DataType.BYTEARRAY:
+-                jobConf.setOutputKeyComparatorClass(PigBytesRawComparator.class);
++                job.setSortComparatorClass(PigBytesRawComparator.class);
+                 break;
+ 
+             case DataType.MAP:
+@@ -657,7 +677,7 @@
+                 throw new JobCreationException(msg, errCode, PigException.INPUT);
+ 
+             case DataType.TUPLE:
+-                jobConf.setOutputKeyComparatorClass(PigTupleRawComparator.class);
++                job.setSortComparatorClass(PigTupleRawComparator.class);
+                 break;
+ 
+             case DataType.BAG:
+@@ -673,27 +693,33 @@
+ 
+         switch (keyType) {
+         case DataType.INTEGER:
+-            jobConf.setOutputKeyComparatorClass(PigIntWritableComparator.class);
++            job.setSortComparatorClass(PigIntWritableComparator.class);
++            job.setGroupingComparatorClass(PigIntRawComparator.class);
+             break;
+ 
+         case DataType.LONG:
+-            jobConf.setOutputKeyComparatorClass(PigLongWritableComparator.class);
++            job.setSortComparatorClass(PigLongWritableComparator.class);
++            job.setGroupingComparatorClass(PigLongRawComparator.class);
+             break;
+ 
+         case DataType.FLOAT:
+-            jobConf.setOutputKeyComparatorClass(PigFloatWritableComparator.class);
++            job.setSortComparatorClass(PigFloatWritableComparator.class);
++            job.setGroupingComparatorClass(PigFloatRawComparator.class);
+             break;
+ 
+         case DataType.DOUBLE:
+-            jobConf.setOutputKeyComparatorClass(PigDoubleWritableComparator.class);
++            job.setSortComparatorClass(PigDoubleWritableComparator.class);
++            job.setGroupingComparatorClass(PigDoubleRawComparator.class);
+             break;
+ 
+         case DataType.CHARARRAY:
+-            jobConf.setOutputKeyComparatorClass(PigCharArrayWritableComparator.class);
++            job.setSortComparatorClass(PigCharArrayWritableComparator.class);
++            job.setGroupingComparatorClass(PigTextRawComparator.class);
+             break;
+ 
+         case DataType.BYTEARRAY:
+-            jobConf.setOutputKeyComparatorClass(PigDBAWritableComparator.class);
++            job.setSortComparatorClass(PigDBAWritableComparator.class);
++            job.setGroupingComparatorClass(PigBytesRawComparator.class);
+             break;
+ 
+         case DataType.MAP:
+@@ -702,7 +728,8 @@
+             throw new JobCreationException(msg, errCode, PigException.INPUT);
+ 
+         case DataType.TUPLE:
+-            jobConf.setOutputKeyComparatorClass(PigTupleWritableComparator.class);
++            job.setSortComparatorClass(PigTupleWritableComparator.class);
++            job.setGroupingComparatorClass(PigTupleRawComparator.class);
+             break;
+ 
+         case DataType.BAG:
+Index: src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/PigInputFormat.java
+===================================================================
+--- src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/PigInputFormat.java	(revision 815927)
++++ src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/PigInputFormat.java	(working copy)
+@@ -23,24 +23,25 @@
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.PathFilter;
+ import org.apache.hadoop.io.Text;
+ import org.apache.hadoop.io.compress.CompressionCodecFactory;
+-import org.apache.hadoop.mapred.FileInputFormat;
+-import org.apache.hadoop.mapred.InputFormat;
+-import org.apache.hadoop.mapred.InputSplit;
+-import org.apache.hadoop.mapred.JobConf;
+-import org.apache.hadoop.mapred.JobConfigurable;
+-import org.apache.hadoop.mapred.Mapper;
+-import org.apache.hadoop.mapred.RecordReader;
++import org.apache.hadoop.mapreduce.InputFormat;
++import org.apache.hadoop.mapreduce.JobContext;
++import org.apache.hadoop.mapreduce.TaskAttemptContext;
++import org.apache.hadoop.mapreduce.InputSplit;
++import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
++import org.apache.hadoop.mapreduce.RecordReader;
+ import org.apache.hadoop.mapred.Reporter;
+ import org.apache.pig.ExecType;
+ import org.apache.pig.FuncSpec;
+ import org.apache.pig.PigException;
+ import org.apache.pig.data.TargetedTuple;
++import org.apache.pig.data.Tuple;
+ import org.apache.pig.Slice;
+ import org.apache.pig.backend.datastorage.DataStorage;
+ import org.apache.pig.backend.executionengine.ExecException;
+@@ -48,7 +49,6 @@
+ import org.apache.pig.backend.hadoop.datastorage.ConfigurationUtil;
+ import org.apache.pig.backend.hadoop.datastorage.HDataStorage;
+ import org.apache.pig.backend.hadoop.executionengine.mapReduceLayer.SliceWrapper;
+-import org.apache.pig.data.Tuple;
+ import org.apache.pig.impl.PigContext;
+ import org.apache.pig.impl.io.FileSpec;
+ import org.apache.pig.impl.io.ValidatingInputFileSpec;
+@@ -56,8 +56,7 @@
+ import org.apache.pig.impl.util.ObjectSerializer;
+ import org.apache.pig.impl.util.Pair;
+ 
+-public class PigInputFormat implements InputFormat<Text, Tuple>,
+-       JobConfigurable {
++public class PigInputFormat extends InputFormat<Text, Tuple> {
+ 
+     public static final Log LOG = LogFactory
+             .getLog(PigInputFormat.class);
+@@ -68,8 +67,9 @@
+             return !name.startsWith("_") && !name.startsWith(".");
+         }
+     };
++    
++    private JobContext job;
+ 
+-    public static JobConf sJob;
+ 
+     /**
+      * Is the given filename splitable? Usually, true, but if the file is stream
+@@ -99,7 +99,7 @@
+      * @throws IOException
+      *             if zero items.
+      */
+-    protected Path[] listPaths(JobConf job) throws IOException {
++    protected Path[] listPaths(JobContext job) throws IOException {
+         Path[] dirs = FileInputFormat.getInputPaths(job);
+         if (dirs.length == 0) {
+             int errCode = 2092;
+@@ -109,7 +109,7 @@
+         
+         List<Path> result = new ArrayList<Path>();
+         for (Path p : dirs) {
+-            FileSystem fs = p.getFileSystem(job);
++            FileSystem fs = p.getFileSystem(job.getConfiguration());
+             FileStatus[] matches = fs.globStatus(p, hiddenFileFilter);
+             for (FileStatus match : matches) {
+                 result.add(fs.makeQualified(match.getPath()));
+@@ -119,7 +119,7 @@
+         return result.toArray(new Path[result.size()]);
+     }
+ 
+-    public void validateInput(JobConf job) throws IOException {
++    public void validateInput(JobContext job) throws IOException {
+         /*ArrayList<FileSpec> inputs = (ArrayList<FileSpec>) ObjectSerializer
+                 .deserialize(job.get("pig.inputs"));
+         Path[] inputDirs = new Path[inputs.size()];
+@@ -178,20 +178,22 @@
+      * per DFS block of the input file. Configures the PigSlice
+      * and returns the list of PigSlices as an array
+      */
+-    @SuppressWarnings("unchecked")
+-	public InputSplit[] getSplits(JobConf job, int numSplits)
+-            throws IOException {
++    public List<org.apache.hadoop.mapreduce.InputSplit> getSplits(JobContext jobcontext) 
++                        throws IOException, InterruptedException {
++    	
++    	Configuration conf = jobcontext.getConfiguration();
++    	
+         ArrayList<Pair<FileSpec, Boolean>> inputs;
+ 		ArrayList<ArrayList<OperatorKey>> inpTargets;
+ 		PigContext pigContext;
+ 		try {
+ 			inputs = (ArrayList<Pair<FileSpec, Boolean>>) ObjectSerializer
+-			        .deserialize(job.get("pig.inputs"));
++			        .deserialize(conf.get("pig.inputs"));
+ 			inpTargets = (ArrayList<ArrayList<OperatorKey>>) ObjectSerializer
+-			        .deserialize(job.get("pig.inpTargets"));
+-			pigContext = (PigContext) ObjectSerializer.deserialize(job
++			        .deserialize(conf.get("pig.inpTargets"));
++			pigContext = (PigContext) ObjectSerializer.deserialize(conf
+ 			        .get("pig.pigContext"));
+-			PigContext.setPackageImportList((ArrayList<String>)ObjectSerializer.deserialize(job.get("udf.import.list")));
++			PigContext.setPackageImportList((ArrayList<String>)ObjectSerializer.deserialize(conf.get("udf.import.list")));
+ 		} catch (Exception e) {
+ 			int errCode = 2094;
+ 			String msg = "Unable to deserialize object.";
+@@ -205,24 +207,24 @@
+                                 
+                 FileSystem fs;
+                                 
+-                try {
+-                   fs = path.getFileSystem(job);
+-                } catch (Exception e) {
+-                   // If an application specific
+-                   // scheme was used
+-                   // (e.g.: "hbase://table") we will fail
+-                   // getting the file system. That's
+-                   // ok, we just use the dfs in that case.
+-                   fs = new Path("/").getFileSystem(job);
+-                }
++                                try {
++                                    fs = path.getFileSystem(conf);
++                                } catch (Exception e) {
++                                    // If an application specific
++                                    // scheme was used
++                                    // (e.g.: "hbase://table") we will fail
++                                    // getting the file system. That's
++                                    // ok, we just use the dfs in that case.
++                                    fs = new Path("/").getFileSystem(conf);
++                                }
+ 
+ 				// if the execution is against Mapred DFS, set
+ 				// working dir to /user/<userid>
+ 				if(pigContext.getExecType() == ExecType.MAPREDUCE) {
+-				    fs.setWorkingDirectory(new Path("/user", job.getUser()));
++				    fs.setWorkingDirectory(new Path("/user", conf.get("user.name")));
+                 }
+ 				
+-				DataStorage store = new HDataStorage(ConfigurationUtil.toProperties(job));
++				DataStorage store = new HDataStorage(ConfigurationUtil.toProperties(conf));
+ 				ValidatingInputFileSpec spec;
+ 				if (inputs.get(i).first instanceof ValidatingInputFileSpec) {
+ 				    spec = (ValidatingInputFileSpec) inputs.get(i).first;
+@@ -245,21 +247,15 @@
+ 				throw new ExecException(msg, errCode, PigException.BUG, e);
+ 			}
+         }
+-        // set the number of map tasks
+-        pigContext.getProperties().setProperty("pig.mapsplits.count", Integer.toString(splits.size()));
+-        job.set("pig.pigContext", ObjectSerializer.serialize(pigContext));
+-        return splits.toArray(new SliceWrapper[splits.size()]);
++        return splits;
+     }
+ 
+-    public RecordReader<Text, Tuple> getRecordReader(InputSplit split,
+-            JobConf job, Reporter reporter) throws IOException {
+-        PigInputFormat.sJob = job;
++    public RecordReader<Text, Tuple> createRecordReader(InputSplit split, 
++    		TaskAttemptContext taskattemptcontext) throws IOException, InterruptedException {   
+         activeSplit = (SliceWrapper) split;
+-        return ((SliceWrapper) split).makeReader(job);
++        return ((SliceWrapper) split).makeReader(taskattemptcontext.getConfiguration());
+     }
+ 
+-    public void configure(JobConf conf) {
+-    }
+ 
+     public static SliceWrapper getActiveSplit() {
+         return activeSplit;
+Index: src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/PigOutputFormat.java
+===================================================================
+--- src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/PigOutputFormat.java	(revision 815927)
++++ src/org/apache/pig/backend/hadoop/executionengine/mapReduceLayer/PigOutputFormat.java	(working copy)
+@@ -19,24 +19,22 @@
+ 
+ import java.io.IOException;
+ import java.io.OutputStream;
++import java.text.NumberFormat;
+ 
++import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+-import org.apache.hadoop.io.Writable;
+ import org.apache.hadoop.io.WritableComparable;
+-import org.apache.hadoop.mapred.FileOutputFormat;
+-import org.apache.hadoop.mapred.JobConf;
+-import org.apache.hadoop.mapred.OutputFormat;
+-import org.apache.hadoop.mapred.RecordWriter;
+-import org.apache.hadoop.mapred.Reporter;
++import org.apache.hadoop.mapreduce.JobContext;
++import org.apache.hadoop.mapreduce.OutputCommitter;
++import org.apache.hadoop.mapreduce.OutputFormat;
++import org.apache.hadoop.mapreduce.TaskAttemptContext;
++import org.apache.hadoop.mapreduce.lib.output.FileOutputCommitter;
++import org.apache.hadoop.mapreduce.RecordWriter;
+ import org.apache.hadoop.util.Progressable;
+-import org.apache.pig.PigException;
+ import org.apache.pig.StoreFunc;
+-import org.apache.pig.backend.executionengine.ExecException;
+ import org.apache.pig.backend.hadoop.executionengine.util.MapRedUtil;
+-import org.apache.pig.builtin.PigStorage;
+ import org.apache.pig.data.Tuple;
+-import org.apache.pig.impl.PigContext;
+ import org.apache.tools.bzip2r.CBZip2OutputStream;
+ 
+ /**
+@@ -45,8 +43,10 @@
+  * image of PigInputFormat having RecordWriter instead
+  * of a RecordReader.
+  */
+-public class PigOutputFormat implements OutputFormat<WritableComparable, Tuple> {
++public class PigOutputFormat extends OutputFormat<WritableComparable, Tuple> {
+     public static final String PIG_OUTPUT_FUNC = "pig.output.func";
++    
++	private OutputCommitter committer;
+ 
+     /**
+      * In general, the mechanism for an OutputFormat in Pig to get hold of the storeFunc
+@@ -65,19 +65,29 @@
+      * {@link org.apache.hadoop.mapred.FileOutputFormat#getWorkOutputPath(JobConf)}
+      * which will provide a safe output directory into which the OutputFormat should write
+      * the part file (given by the name argument in the getRecordWriter() call).
+-     */
+-    public RecordWriter<WritableComparable, Tuple> getRecordWriter(FileSystem fs, JobConf job,
+-            String name, Progressable progress) throws IOException {
+-        Path outputDir = FileOutputFormat.getWorkOutputPath(job);
+-        return getRecordWriter(fs, job, outputDir, name, progress);
++     */  
++    public RecordWriter<WritableComparable, Tuple> getRecordWriter(TaskAttemptContext taskattemptcontext)
++                throws IOException, InterruptedException {    	
++    	Configuration conf = taskattemptcontext.getConfiguration();
++    	FileSystem fs = FileSystem.get(conf);    		    	
++    	
++    	Path outputDir = ((FileOutputCommitter)getOutputCommitter(taskattemptcontext)).getWorkPath();
++            	
++    	// build file name like 'part-00000'    	
++    	NumberFormat numberFormat = NumberFormat.getInstance();
++        numberFormat.setMinimumIntegerDigits(5);
++        numberFormat.setGroupingUsed(false);
++        String name = "part-" + numberFormat.format(taskattemptcontext.getTaskAttemptID().getTaskID().getId());  
++        
++    	return getRecordWriter(fs, conf, outputDir, name, taskattemptcontext);
+     }
+ 
+-    public PigRecordWriter getRecordWriter(FileSystem fs, JobConf job,
++    public PigRecordWriter getRecordWriter(FileSystem fs, Configuration job,
+             Path outputDir, String name, Progressable progress)
+             throws IOException {
+         StoreFunc store = MapRedUtil.getStoreFunc(job);
+-
+-        String parentName = FileOutputFormat.getOutputPath(job).getName();
++    
++        String parentName = job.get("mapred.output.dir");
+         int suffixStart = parentName.lastIndexOf('.');
+         if (suffixStart != -1) {
+             String suffix = parentName.substring(suffixStart);
+@@ -85,15 +95,13 @@
+                 name = name + suffix;
+             }
+         }
++       
+         return new PigRecordWriter(fs, new Path(outputDir, name), store);
+     }
+ 
+-    public void checkOutputSpecs(FileSystem fs, JobConf job) throws IOException {
+-        // TODO We really should validate things here
+-        return;
+-    }
++   
+ 
+-    static public class PigRecordWriter implements
++    static public class PigRecordWriter extends
+             RecordWriter<WritableComparable, Tuple> {
+         private OutputStream os = null;
+ 
+@@ -122,10 +130,26 @@
+             this.sfunc.putNext(value);
+         }
+ 
+-        public void close(Reporter reporter) throws IOException {
+-            sfunc.finish();
++		@Override
++		public void close(TaskAttemptContext taskattemptcontext) throws IOException, InterruptedException {
++			sfunc.finish();
+             os.close();
+-        }
++		}
+ 
+     }
++
++	@Override
++	public void checkOutputSpecs(JobContext jobcontext) throws IOException, InterruptedException {
++		
++	}
++
++	@Override
++	public OutputCommitter getOutputCommitter(TaskAttemptContext taskattemptcontext) throws IOException, InterruptedException {
++		if (committer == null)  {
++			String outputDir = taskattemptcontext.getConfiguration().get("mapred.output.dir");			
++			committer = new FileOutputCommitter(new Path(outputDir), taskattemptcontext);
++		}
++		
++		return committer;
++	}
+ }
+Index: src/org/apache/pig/backend/hadoop/executionengine/util/MapRedUtil.java
+===================================================================
+--- src/org/apache/pig/backend/hadoop/executionengine/util/MapRedUtil.java	(revision 815927)
++++ src/org/apache/pig/backend/hadoop/executionengine/util/MapRedUtil.java	(working copy)
+@@ -5,8 +5,8 @@
+ 
+ import java.io.IOException;
+ 
++import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileSystem;
+-import org.apache.hadoop.mapred.JobConf;
+ import org.apache.hadoop.util.Progressable;
+ import org.apache.pig.PigException;
+ import org.apache.pig.StoreConfig;
+@@ -51,7 +51,7 @@
+      * @return the StoreFunc reference
+      * @throws ExecException
+      */
+-    public static StoreFunc getStoreFunc(JobConf conf) throws ExecException {
++    public static StoreFunc getStoreFunc(Configuration conf) throws ExecException {
+         StoreFunc store;
+         try {
+             String storeFunc = conf.get("pig.storeFunc", "");
+@@ -82,7 +82,7 @@
+      * an OutputFormat to write the data
+      * @throws IOException
+      */
+-    public static StoreConfig getStoreConfig(JobConf conf) throws IOException {
++    public static StoreConfig getStoreConfig(Configuration conf) throws IOException {
+         return (StoreConfig) ObjectSerializer.deserialize(conf.get(JobControlCompiler.PIG_STORE_CONFIG));
+     }
+ 
+@@ -96,7 +96,7 @@
+ 	 */	
+ 	@SuppressWarnings("unchecked")
+ 	public static <E> Map<E, Pair<Integer, Integer> > loadPartitionFile(String keyDistFile,
+-								 Integer[] totalReducers, JobConf job, byte keyType) throws IOException {
++								 Integer[] totalReducers, Configuration job, byte keyType) throws IOException {
+ 
+ 		Map<E, Pair<Integer, Integer> > reducerMap = new HashMap<E, Pair<Integer, Integer> >();
+ 		
+Index: src/org/apache/pig/backend/hadoop/streaming/HadoopExecutableManager.java
+===================================================================
+--- src/org/apache/pig/backend/hadoop/streaming/HadoopExecutableManager.java	(revision 815927)
++++ src/org/apache/pig/backend/hadoop/streaming/HadoopExecutableManager.java	(working copy)
+@@ -23,12 +23,12 @@
+ import java.util.Date;
+ import java.util.List;
+ 
++import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FSDataOutputStream;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.FileUtil;
+ import org.apache.hadoop.fs.Path;
+-import org.apache.hadoop.mapred.JobConf;
+-import org.apache.hadoop.mapred.TaskAttemptID;
++import org.apache.hadoop.mapreduce.TaskAttemptID;
+ import org.apache.pig.PigException;
+ import org.apache.pig.backend.executionengine.ExecException;
+ import org.apache.pig.backend.hadoop.executionengine.mapReduceLayer.PigMapReduce;
+@@ -57,7 +57,7 @@
+       return "part-" + NUMBER_FORMAT.format(partition);
+     }
+ 
+-    JobConf job;
++    Configuration job;
+     
+     String scriptOutputDir;
+     String scriptLogDir;
+Index: src/org/apache/pig/tools/pigstats/PigStats.java
+===================================================================
+--- src/org/apache/pig/tools/pigstats/PigStats.java	(revision 815502)
++++ src/org/apache/pig/tools/pigstats/PigStats.java	(working copy)
+@@ -29,12 +29,13 @@
+ import java.util.Map;
+ import java.util.Set;
+ 
++import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.mapred.Counters;
+ import org.apache.hadoop.mapred.JobClient;
+-import org.apache.hadoop.mapred.JobConf;
+ import org.apache.hadoop.mapred.RunningJob;
+-import org.apache.hadoop.mapred.jobcontrol.Job;
+-import org.apache.hadoop.mapred.jobcontrol.JobControl;
++import org.apache.hadoop.mapreduce.Job;
++import org.apache.hadoop.mapreduce.lib.jobcontrol.JobControl;
++import org.apache.hadoop.mapreduce.lib.jobcontrol.ControlledJob;
+ import org.apache.pig.ExecType;
+ import org.apache.pig.backend.executionengine.ExecException;
+ import org.apache.pig.backend.hadoop.executionengine.mapReduceLayer.plans.MROperPlan;
+@@ -109,24 +110,24 @@
+     
+     private Map<String, Map<String, String>> accumulateMRStats() throws ExecException {
+         
+-        for(Job job : jc.getSuccessfulJobs()) {
++        for(ControlledJob job : jc.getSuccessfulJobList()) {
+             
+             
+-            JobConf jobConf = job.getJobConf();
++               Configuration jobConf = job.getJob().getConfiguration();
+             
+             
+                 RunningJob rj = null;
+-                try {
+-                    rj = jobClient.getJob(job.getAssignedJobID());
++                /*try { 
++                	
+                 } catch (IOException e1) {
+                     String error = "Unable to get the job statistics from JobClient.";
+                     throw new ExecException(error, e1);
+-                }
++                }*/
+                 if(rj == null)
+                     continue;
+                 
+                 Map<String, String> jobStats = new HashMap<String, String>();
+-                stats.put(job.getAssignedJobID().toString(), jobStats);
++                stats.put(job.getJobID(), jobStats);
+                 
+                 try {
+                     PhysicalPlan plan = (PhysicalPlan) ObjectSerializer.deserialize(jobConf.get("pig.mapPlan"));
+@@ -169,7 +170,6 @@
+                         jobStats.put("PIG_STATS_REDUCE_OUTPUT_RECORDS", "-1");
+                         jobStats.put("PIG_STATS_BYTES_WRITTEN", "-1");
+                     }
+-                    
+                 } catch (IOException e) {
+                     // TODO Auto-generated catch block
+                     String error = "Unable to get the counters.";
+@@ -177,25 +177,31 @@
+                 }
+         }
+         
+-        getLastJobIDs(jc.getSuccessfulJobs());
++        getLastJobIDs(jc.getSuccessfulJobList());
+         
+         return stats;
+     }
+     
+ 
+-    private void getLastJobIDs(List<Job> jobs) {
++    private void getLastJobIDs(List<ControlledJob> jobs) {
+         rootJobIDs.clear();
+-         Set<Job> temp = new HashSet<Job>();
+-         for(Job job : jobs) {
+-             if(job.getDependingJobs() != null && job.getDependingJobs().size() > 0)
+-                 temp.addAll(job.getDependingJobs());
++         Set<ControlledJob> temp = new HashSet<ControlledJob>();
++         for(ControlledJob job : jobs) {
++             if(job.getDependentJobs() != null && job.getDependentJobs().size() > 0)
++                 temp.addAll(job.getDependentJobs());
+          }
+          
+          //difference between temp and jobs would be the set of leaves
+          //we can safely assume there would be only one leaf
+-         for(Job job : jobs) {
++         for(ControlledJob job : jobs) {
+              if(temp.contains(job)) continue;
+-             else rootJobIDs.add(job.getAssignedJobID().toString());
++             else {
++            	 if (job.getJobID() != null) {
++            		 rootJobIDs.add(job.getJobID());
++            	 }else{
++            		 System.out.println("job id is null");
++            	 }
++             }
+          }
+     }
+     
+Index: src/org/apache/pig/impl/io/FileLocalizer.java
+===================================================================
+--- src/org/apache/pig/impl/io/FileLocalizer.java	(revision 815927)
++++ src/org/apache/pig/impl/io/FileLocalizer.java	(working copy)
+@@ -35,7 +35,7 @@
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+-import org.apache.hadoop.mapred.JobConf;
++import org.apache.hadoop.conf.Configuration;
+ import org.apache.pig.ExecType;
+ import org.apache.pig.backend.datastorage.ContainerDescriptor;
+ import org.apache.pig.backend.datastorage.DataStorage;
+@@ -155,7 +155,7 @@
+     public static InputStream openDFSFile(String fileName) throws IOException {
+         SliceWrapper wrapper = PigInputFormat.getActiveSplit();
+ 
+-        JobConf conf = null;
++        Configuration conf = null;
+         if (wrapper == null) {
+         	conf = PigMapReduce.sJobConf;
+         }else{
+@@ -180,7 +180,7 @@
+     public static long getSize(String fileName) throws IOException {
+     	SliceWrapper wrapper = PigInputFormat.getActiveSplit();
+     	
+-    	JobConf conf = null;
++    	Configuration conf = null;
+     	if (wrapper == null) {
+     		conf = PigMapReduce.sJobConf;
+     	}else{
+Index: build.xml
+===================================================================
+--- build.xml	(revision 815927)
++++ build.xml	(working copy)
+@@ -47,7 +47,7 @@
+     <!-- property name="build.encoding" value="ISO-8859-1" / -->
+     <property name="build.encoding" value="UTF8" />
+     <!-- TODO with only one version of hadoop in the lib folder we do not need that anymore -->
+-    <property name="hadoop.jarfile" value="hadoop20.jar" />
++    <property name="hadoop.jarfile" value="hadoop21.jar" />
+     <property name="hbase.jarfile" value="hbase-0.18.1.jar" />
+     <property name="hbase.test.jarfile" value="hbase-0.18.1-test.jar" />
+ 
+@@ -158,7 +158,7 @@
+     <!-- setup the classpath -->
+     <path id="classpath">
+ 	<path refid="compile.classpath"/>	
+-        <fileset file="${lib.dir}/${hadoop.jarfile}" />
++        <fileset file="${lib.dir}/${hadoop.jarfile}" /> 
+         <fileset file="${lib.dir}/${hbase.jarfile}" />
+         <fileset file="${lib.dir}/${hbase.test.jarfile}" />
+    <!-- <fileset file="${lib.dir}/commons-collections-3.2.jar" />  -->
+@@ -410,7 +410,7 @@
+                     <attribute name="Svn-Revision" value="${svnString}" />
+                 </section>
+             </manifest>
+-            <zipfileset src="${lib.dir}/${hadoop.jarfile}" />
++            <zipfileset src="${lib.dir}/${hadoop.jarfile}" /> 
+             <zipfileset src="${ivy.lib.dir}/junit-${junit.version}.jar" />
+             <zipfileset src="${ivy.lib.dir}/jsch-${jsch.version}.jar" />
+             <zipfileset src="${ivy.lib.dir}/jline-${jline.version}.jar" />
